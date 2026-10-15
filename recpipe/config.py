@@ -17,6 +17,7 @@ DEFAULTS = {
     "language": "en",  # "en" or "auto"; only matters for the multilingual large-v3
     "threads": 0,  # 0 = automatic
     "quality": "balanced",  # fast | balanced | best (see pipeline.PRESETS)
+    "theme": "system",  # system | light | dark
     "models_dir": "",  # "" = <app folder>/models
 }
 

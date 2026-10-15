@@ -1,5 +1,10 @@
 """Tkinter window: drop files in, get a speaker-labelled transcript out.
 
+Look: the Sun Valley ttk theme (Windows 11 style) following the Windows light/dark
+setting, Segoe Fluent icons, and Pillow-rendered antialiased artwork for the drop
+zone. Every piece degrades gracefully: without sv-ttk the stock theme is used,
+without Pillow the icons are left out.
+
 The GUI never imports torch or whisperx. One long-lived worker process
 (`app.py --worker --jsonl --serve`) takes JSON commands on stdin and streams
 JSON progress events back. It is started when the window opens and loads the
@@ -24,35 +29,68 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from . import APP_NAME, config, deps, env
 from .errors import DIARIZATION_URL, TOKENS_URL
 from .formats import clock, human_duration
-from .pipeline import DEFAULT_MODEL, DEFAULT_QUALITY, DIARIZATION, MODELS, QUALITY, SUPPORTED_EXTS, missing_components
+from .pipeline import (DEFAULT_MODEL, DEFAULT_QUALITY, DIARIZATION, MODELS, QUALITY, SUPPORTED_EXTS, Job,
+                       load_calibration, missing_components, plan_stages)
 
 try:
     from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
 except Exception:  # still usable (click to browse) without drag-and-drop
     TkinterDnD = None
+try:
+    import sv_ttk
+except Exception:  # falls back to the stock Windows look
+    sv_ttk = None
+try:
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+except Exception:  # icons and antialiased artwork are optional
+    Image = None
 
+# Taskbar identity. create_shortcut.ps1 stamps the same ID on the shortcut, so the
+# running window groups under the pinned icon instead of a generic Python button.
+APP_ID = "LocalTranscriber.App"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 AUTO_SPEAKERS = "Auto-detect"
 NO_LABELS = "No speaker labels"
 SPEAKER_CHOICES = [AUTO_SPEAKERS, NO_LABELS, "2", "3", "4", "5", "6", "7", "8"]
-MODEL_HINTS = {"small.en": "fastest", "medium.en": "balanced", "large-v3": "most accurate, slowest"}
-QUALITY_LABELS = {"fast": "Fastest", "balanced": "Balanced (recommended)", "best": "Most accurate"}
+MODEL_HINTS = {"small.en": "Fastest, fine for clear audio", "medium.en": "Recommended balance",
+               "large-v3": "Most accurate, slowest"}
+QUALITY_LABELS = {"fast": "Fastest", "balanced": "Balanced", "best": "Most accurate"}
+QUALITY_HINTS = {"fast": "Quickest speaker detection", "balanced": "Recommended",
+                 "best": "Slowest, library defaults"}
+THEME_LABELS = {"system": "Match Windows", "light": "Light", "dark": "Dark"}
 
-BG, CARD, BORDER = "#f5f6f8", "#ffffff", "#cfd6df"
-ACCENT, ACCENT_SOFT = "#2f6fdf", "#eaf1fd"
-TEXT, MUTED = "#1d2330", "#667085"
-BANNERS = {  # background, foreground, icon
-    "error": ("#fdeceb", "#a4262c", "✖"),
-    "warning": ("#fff5dc", "#7a4a00", "⚠"),
-    "info": ("#e9f2fe", "#1f4f99", "ℹ"),
-    "success": ("#e8f5ec", "#1e6b36", "✔"),
+PALETTES = {
+    "dark": {
+        "bg": "#1c1c1c", "surface": "#242424", "surface_active": "#1d2a35", "border": "#353535",
+        "text": "#fafafa", "muted": "#a3a3a3", "subtle": "#737373", "accent": "#57c8ff", "on_accent": "#000000",
+        "select": "#264f78",
+        "speakers": ["#6cb8ff", "#ffb06a", "#7fd88f", "#d7a6ff", "#ff9b9b", "#66d9e8", "#f2cc60", "#ff94c9"],
+        "banners": {"error": ("#442726", "#ffb4ab"), "warning": ("#433519", "#fcd581"),
+                    "info": ("#1d3349", "#9ccfff"), "success": ("#1e3a26", "#8fd9a2")},
+        "status": {"ok": "#6ccb5f", "busy": "#fcd581", "work": "#57c8ff", "off": "#737373", "error": "#ff99a4"},
+    },
+    "light": {
+        "bg": "#fafafa", "surface": "#ffffff", "surface_active": "#eaf3fc", "border": "#e0e0e0",
+        "text": "#1c1c1c", "muted": "#5c5c5c", "subtle": "#999999", "accent": "#005fb8", "on_accent": "#ffffff",
+        "select": "#cce4f7",
+        "speakers": ["#0f62c4", "#c2410c", "#15803d", "#7e22ce", "#b91c1c", "#0e7490", "#a16207", "#be185d"],
+        "banners": {"error": ("#fde7e9", "#a4262c"), "warning": ("#fff4ce", "#7a4f00"),
+                    "info": ("#e5f1fb", "#0f5499"), "success": ("#dff6dd", "#0e700e")},
+        "status": {"ok": "#0e7a0d", "busy": "#c18a00", "work": "#005fb8", "off": "#999999", "error": "#c42b1c"},
+    },
 }
-SPEAKER_COLORS = ["#2f6fdf", "#c2410c", "#15803d", "#7e22ce", "#b91c1c", "#0e7490", "#a16207", "#be185d"]
+ICONS = {  # Segoe Fluent Icons / Segoe MDL2 Assets code points
+    "settings": "\uE713", "copy": "\uE8C8", "open": "\uE7C3", "captions": "\uE7F0", "folder": "\uE838",
+    "cancel": "\uE711", "check": "\uE73E", "warning": "\uE7BA", "info": "\uE946", "error": "\uEA39",
+    "success": "\uE930", "link": "\uE8A7", "download": "\uE896",
+}
+SPEAKER_TAGS = len(PALETTES["dark"]["speakers"])  # same length in every palette
+ICON_FONTS = [r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf"]
 HEADING_RE = re.compile(r"^(?:(?P<speaker>.+?) )?(?P<stamp>\[\d{2}:\d{2}(?::\d{2})? - \d{2}:\d{2}(?::\d{2})?\])$")
 
 
@@ -67,13 +105,55 @@ def human_eta(seconds: float) -> str:
 
 def short_path(path, limit: int = 60) -> str:
     text = str(path)
-    return text if len(text) <= limit else f"{text[:18]}…{text[-(limit - 19):]}"
+    return text if len(text) <= limit else f"{text[:18]}\u2026{text[-(limit - 19):]}"
+
+
+def speaker_hint(choice: str) -> str:
+    if choice == AUTO_SPEAKERS:
+        return "Finds how many voices there are"
+    if choice == NO_LABELS:
+        return "Plain transcript, a bit faster"
+    return f"Exactly {choice} voices"
 
 
 def worker_command(args: list[str]) -> list[str]:
     if getattr(sys, "frozen", False):
         return [sys.executable, "--worker", *args]
     return [deps.console_python(), str(env.APP_DIR / "app.py"), "--worker", *args]
+
+
+def system_theme() -> str:
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
+    except (ImportError, OSError):
+        return "light"
+
+
+def resolve_theme(preference: str) -> str:
+    return preference if preference in ("light", "dark") else system_theme()
+
+
+def set_title_bar(window: tk.Misc, dark: bool, repaint: bool = False) -> None:
+    """Dark or light window title bar to match the theme (Windows 10 20H1+ / 11)."""
+    if sys.platform != "win32":
+        return
+    try:
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1 if dark else 0)
+        for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE, and its pre-20H1 number
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(value),
+                                                         ctypes.sizeof(value)) == 0:
+                break
+        if repaint:  # Windows only redraws the caption on the next frame change
+            window.wm_attributes("-alpha", 0.99)
+            window.after(30, lambda: window.wm_attributes("-alpha", 1.0))
+    except (AttributeError, OSError, tk.TclError):
+        pass
 
 
 class Worker:
@@ -129,6 +209,122 @@ class Worker:
             pass
 
 
+class Look:
+    """Fonts, palette, icons and theme switching shared by the main window and its dialogs."""
+
+    def __init__(self, root: tk.Tk, theme: str):
+        self.root = root
+        self.scale = root.winfo_fpixels("1i") / 96
+        self.theme = theme
+        self.p = PALETTES[theme]
+        families = set(tkfont.families(root))
+
+        def pick(*names):
+            return next((n for n in names if n in families), names[-1])
+
+        self.families = {
+            "text": pick("Segoe UI Variable Text", "Segoe UI"),
+            "strong": pick("Segoe UI Variable Text Semibold", "Segoe UI Semibold"),
+            "display": pick("Segoe UI Variable Display Semib", "Segoe UI Semibold"),
+            "small": pick("Segoe UI Variable Small", "Segoe UI"),
+            "small_strong": pick("Segoe UI Variable Small Semibol", "Segoe UI Semibold"),
+        }
+        f = self.families
+
+        def font(family, size):
+            return tkfont.Font(root=root, family=family, size=size)
+
+        self.fonts = {
+            "title": font(f["display"], 18), "section": font(f["strong"], 11), "body": font(f["text"], 10),
+            "strong": font(f["strong"], 10), "caption": font(f["small_strong"], 8), "hint": font(f["small"], 9),
+            "reading": font(f["text"], 11), "reading_strong": font(f["strong"], 11),
+            "doc_title": font(f["display"], 14), "stamp": font(f["small"], 9), "drop": font(f["display"], 14),
+            "estimate": font(f["display"], 16), "placeholder": font(f["display"], 13), "mono": font("Consolas", 9),
+        }
+        self.icon_font_path = next((path for path in ICON_FONTS if os.path.exists(path)), None)
+        self._icon_fonts: dict[int, object] = {}
+        self._images: dict[tuple, object] = {}
+
+    def px(self, value: float) -> int:
+        return int(round(value * self.scale))
+
+    def apply(self, theme: str) -> None:
+        self.theme, self.p = theme, PALETTES[theme]
+        p, style = self.p, ttk.Style(self.root)
+        if sv_ttk is not None:
+            sv_ttk.set_theme(theme, self.root)
+            self._scale_theme_fonts()
+        else:
+            style.theme_use("vista" if "vista" in style.theme_names() else "clam")
+            for name in ("TFrame", "TLabel", "TCheckbutton", "TRadiobutton"):
+                style.configure(name, background=p["bg"], foreground=p["text"])
+            style.configure("Card.TFrame", background=p["bg"], relief="solid", borderwidth=1)
+        style.configure("Title.TLabel", font=self.fonts["title"], foreground=p["text"])
+        style.configure("Section.TLabel", font=self.fonts["section"], foreground=p["text"])
+        style.configure("Strong.TLabel", font=self.fonts["strong"], foreground=p["text"])
+        style.configure("Muted.TLabel", font=self.fonts["body"], foreground=p["muted"])
+        style.configure("Caption.TLabel", font=self.fonts["caption"], foreground=p["muted"])
+        style.configure("Hint.TLabel", font=self.fonts["hint"], foreground=p["muted"])
+        style.configure("Estimate.TLabel", font=self.fonts["estimate"], foreground=p["text"])
+        for kind, (bg, _fg) in p["banners"].items():
+            style.configure(f"{kind.title()}.TButton", background=bg)  # rounded corners blend into the banner
+        self.root.configure(bg=p["bg"])
+
+    def _scale_theme_fonts(self) -> None:
+        """sv-ttk sizes fonts in pixels, which stay tiny on scaled displays; use points instead."""
+        f = self.families
+        for name, family, size in (("SunValleyCaptionFont", f["small"], 9), ("SunValleyBodyFont", f["text"], 10),
+                                   ("SunValleyBodyStrongFont", f["strong"], 10),
+                                   ("SunValleyBodyLargeFont", f["text"], 13),
+                                   ("SunValleySubtitleFont", f["display"], 15),
+                                   ("SunValleyTitleFont", f["display"], 21),
+                                   ("SunValleyTitleLargeFont", f["display"], 30),
+                                   ("SunValleyDisplayFont", f["display"], 50)):
+            try:
+                self.root.tk.call("font", "configure", name, "-family", family, "-size", size)
+            except tk.TclError:
+                pass
+
+    def icon(self, name: str, color: str | None = None, size: int = 16):
+        """A Fluent icon as a PhotoImage, or "" when the icon font or Pillow is unavailable."""
+        if Image is None or self.icon_font_path is None or name not in ICONS:
+            return ""
+        color = color or self.p["text"]
+        key = (name, color, size)
+        if key not in self._images:
+            px = max(8, self.px(size))
+            if px not in self._icon_fonts:
+                self._icon_fonts[px] = ImageFont.truetype(self.icon_font_path, px)
+            img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+            ImageDraw.Draw(img).text((px / 2, px / 2), ICONS[name], font=self._icon_fonts[px], fill=color, anchor="mm")
+            self._images[key] = ImageTk.PhotoImage(img, master=self.root)
+        return self._images[key]
+
+    def button_image(self, name: str, accent: bool = False):
+        """Icon for a button, greyed out when the button is disabled."""
+        normal = self.icon(name, self.p["on_accent"] if accent else self.p["text"])
+        if not normal:
+            return ""
+        return (normal, "disabled", self.icon(name, self.p["subtle"]))
+
+    def logo(self, size: int):
+        key = ("logo", size)
+        if key not in self._images:
+            path = env.APP_DIR / "assets" / "app.png"
+            if Image is not None and path.exists():
+                img = Image.open(path).convert("RGBA").resize((self.px(size), self.px(size)), Image.LANCZOS)
+                self._images[key] = ImageTk.PhotoImage(img, master=self.root)
+            else:
+                self._images[key] = ""
+        return self._images[key]
+
+    def style_text(self, box: tk.Text, mono: bool = False) -> None:
+        p = self.p
+        box.configure(bg=p["bg"], fg=p["text"], insertbackground=p["text"], selectbackground=p["select"],
+                      selectforeground=p["text"], inactiveselectbackground=p["select"],
+                      font=self.fonts["mono" if mono else "reading"])
+
+
 def _round_rect(canvas: tk.Canvas, x1, y1, x2, y2, r, **kwargs):
     points = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
               x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
@@ -139,6 +335,7 @@ class App:
     def __init__(self, root: tk.Tk, dnd: bool):
         self.root, self.dnd = root, dnd
         self.cfg = config.load()
+        self.look = Look(root, resolve_theme(self.cfg.get("theme", "system")))
         self.events: queue.Queue = queue.Queue()
         self.pending: deque[Path] = deque()
         self.worker: Worker | None = None
@@ -150,103 +347,140 @@ class App:
         self.outputs: dict = {}
         self.transcript = ""
         self.setup_ok = False
-        self.banner_kind = None
+        self.banner_state: tuple | None = None  # kept so a theme switch can redraw the banner
         self.install_window = None
-        self.status = ""
+        self.status = ("Starting\u2026", "busy")
+        self.drop_state = "idle"
+        self._drop_after = None
+        self._icon_buttons: list[tuple[ttk.Button, str, bool]] = []
         self._build()
+        self.apply_theme(self.look.theme)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.report_callback_exception = self._on_tk_error
+        root.bind("<Control-o>", lambda e: self.browse())
         root.after(150, self._poll)
         root.after(300, self.startup_checks)
+
+    @property
+    def p(self) -> dict:
+        return self.look.p
+
+    @property
+    def banner_kind(self) -> str | None:
+        return self.banner_state[0] if self.banner_state else None
 
     # ------------------------------------------------------------ layout
 
     def _build(self):
-        root = self.root
-        s = self.scale = root.winfo_fpixels("1i") / 96
+        root, P = self.root, self.look.px
         root.title(APP_NAME)
-        root.configure(bg=BG)
-        root.geometry(f"{int(900 * s)}x{int(780 * s)}")
-        root.minsize(int(660 * s), int(600 * s))
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(P(980), int(sw * 0.92)), min(P(860), sh - P(90))
+        root.geometry(f"{w}x{h}+{max((sw - w) // 2, 0)}+{max((sh - h) // 2 - P(20), 0)}")
+        root.minsize(P(760), P(640))
 
-        style = ttk.Style(root)
-        style.configure(".", font=("Segoe UI", 10))
-        for name in ("TFrame", "TLabel", "TCheckbutton", "TRadiobutton"):
-            style.configure(name, background=BG)
-        style.configure("TLabel", foreground=TEXT)
-        style.configure("Muted.TLabel", foreground=MUTED)
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
-        style.configure("Section.TLabel", font=("Segoe UI Semibold", 11))
-
-        outer = ttk.Frame(root, padding=(int(18 * s), int(14 * s)))
+        outer = ttk.Frame(root, padding=(P(28), P(22), P(28), P(12)))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(6, weight=1)
 
+        # -- header
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
-        ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        ttk.Button(header, text="Settings…", command=self.open_settings).pack(side="right", padx=(14, 0))
+        header.columnconfigure(1, weight=1)
+        self.logo_label = ttk.Label(header)
+        self.logo_label.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, P(14)))
+        ttk.Label(header, text=APP_NAME, style="Title.TLabel").grid(row=0, column=1, sticky="sw")
+        ttk.Label(header, text="Private transcription with speaker labels. Everything stays on this PC.",
+                  style="Muted.TLabel").grid(row=1, column=1, sticky="nw")
+        self.settings_btn = ttk.Button(header, text="Settings", compound="left", command=self.open_settings)
+        self.settings_btn.grid(row=0, column=2, rowspan=2, sticky="e")
+        self._icon_buttons.append((self.settings_btn, "settings", False))
+
+        # -- options card
+        opts = ttk.Frame(outer, style="Card.TFrame", padding=(P(18), P(12), P(18), P(14)))
+        opts.grid(row=1, column=0, sticky="ew", pady=(P(18), 0))
+        opts.columnconfigure(3, weight=1)
+        self.model_var = tk.StringVar(value=self.cfg["model"] if self.cfg["model"] in MODELS else DEFAULT_MODEL)
         self.speakers_var = tk.StringVar(
             value=self.cfg["speakers"] if self.cfg["speakers"] in SPEAKER_CHOICES else AUTO_SPEAKERS)
-        speakers = ttk.Combobox(header, textvariable=self.speakers_var, values=SPEAKER_CHOICES,
-                                state="readonly", width=17)
-        speakers.pack(side="right")
-        ttk.Label(header, text="Speakers").pack(side="right", padx=(18, 6))
-        self.model_hint = ttk.Label(header, style="Muted.TLabel")
-        self.model_hint.pack(side="right", padx=(6, 0))
-        self.model_var = tk.StringVar(value=self.cfg["model"] if self.cfg["model"] in MODELS else DEFAULT_MODEL)
-        model = ttk.Combobox(header, textvariable=self.model_var, values=MODELS, state="readonly", width=10)
-        model.pack(side="right")
-        ttk.Label(header, text="Model").pack(side="right", padx=(0, 6))
-        model.bind("<<ComboboxSelected>>", lambda e: self._model_changed())
-        speakers.bind("<<ComboboxSelected>>", lambda e: self._remember_choices())
-        self._update_model_hint()
+        quality = self.cfg.get("quality") if self.cfg.get("quality") in QUALITY else DEFAULT_QUALITY
+        self.quality_var = tk.StringVar(value=QUALITY_LABELS[quality])
 
-        ttk.Label(outer, text="Runs entirely on this PC — audio and transcripts never leave your computer.",
-                  style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, int(10 * s)))
+        def field(column, caption, variable, values, width):
+            ttk.Label(opts, text=caption, style="Caption.TLabel").grid(row=0, column=column, sticky="w", padx=(0, P(22)))
+            box = ttk.Combobox(opts, textvariable=variable, values=values, state="readonly", width=width)
+            box.grid(row=1, column=column, sticky="w", padx=(0, P(22)), pady=(P(4), P(4)))
+            hint = ttk.Label(opts, style="Hint.TLabel")
+            hint.grid(row=2, column=column, sticky="w", padx=(0, P(22)))
+            return box, hint
 
-        self.drop = tk.Canvas(outer, height=int(140 * s), bg=BG, highlightthickness=0, cursor="hand2")
-        self.drop.grid(row=2, column=0, sticky="ew")
-        self.drop.bind("<Configure>", lambda e: self._draw_drop())
+        model_box, self.model_hint = field(0, "MODEL", self.model_var, MODELS, 13)
+        speakers_box, self.speakers_hint = field(1, "SPEAKERS", self.speakers_var, SPEAKER_CHOICES, 18)
+        quality_box, self.quality_hint = field(2, "SPEED", self.quality_var, list(QUALITY_LABELS.values()), 14)
+        model_box.bind("<<ComboboxSelected>>", lambda e: self._choices_changed(rewarm=True))
+        speakers_box.bind("<<ComboboxSelected>>", lambda e: self._choices_changed(rewarm=False))
+        quality_box.bind("<<ComboboxSelected>>", lambda e: self._choices_changed(rewarm=True))
+        estimate = ttk.Frame(opts)
+        estimate.grid(row=0, column=3, rowspan=3, sticky="e")
+        ttk.Label(estimate, text="ESTIMATED TIME", style="Caption.TLabel").pack(anchor="e")
+        self.estimate_value = ttk.Label(estimate, style="Estimate.TLabel")
+        self.estimate_value.pack(anchor="e")
+        ttk.Label(estimate, text="per hour of audio on this PC", style="Hint.TLabel").pack(anchor="e")
+
+        # -- drop zone
+        self.drop = tk.Canvas(outer, height=P(150), highlightthickness=0, bd=0, cursor="hand2")
+        self.drop.grid(row=2, column=0, sticky="ew", pady=(P(16), 0))
+        self.drop.bind("<Configure>", lambda e: self._schedule_drop_redraw())
         self.drop.bind("<Button-1>", lambda e: self.browse())
+        self.drop.bind("<Enter>", lambda e: self._set_drop_state("hover"))
+        self.drop.bind("<Leave>", lambda e: self._set_drop_state("idle"))
 
         self._build_banner(outer)
         self._build_progress(outer)
 
+        # -- transcript header with actions
         heading = ttk.Frame(outer)
-        heading.grid(row=5, column=0, sticky="ew", pady=(int(16 * s), int(6 * s)))
-        ttk.Label(heading, text="Transcript", style="Section.TLabel").pack(side="left")
+        heading.grid(row=5, column=0, sticky="ew", pady=(P(20), P(8)))
+        heading.columnconfigure(1, weight=1)
+        ttk.Label(heading, text="Transcript", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         self.file_label = ttk.Label(heading, style="Muted.TLabel")
-        self.file_label.pack(side="left", padx=10)
-
-        frame = tk.Frame(outer, bg=BORDER, padx=1, pady=1)
-        frame.grid(row=6, column=0, sticky="nsew")
-        self.text = tk.Text(frame, wrap="word", relief="flat", bg=CARD, fg=TEXT, font=("Segoe UI", 10),
-                            padx=int(14 * s), pady=int(10 * s), spacing1=2, spacing3=2,
-                            highlightthickness=0, insertwidth=0, cursor="arrow")
-        scroll = ttk.Scrollbar(frame, command=self.text.yview)
-        self.text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.text.pack(side="left", fill="both", expand=True)
-        self.text.tag_configure("meta", foreground=MUTED)
-        self.text.tag_configure("stamp", foreground=MUTED, font=("Segoe UI", 9))
-        self.text.tag_configure("placeholder", foreground=MUTED, justify="center", spacing1=int(40 * s))
-        for i, color in enumerate(SPEAKER_COLORS):
-            self.text.tag_configure(f"spk{i}", foreground=color, font=("Segoe UI Semibold", 10))
-        self._set_placeholder("Your transcript will appear here.")
-
-        actions = ttk.Frame(outer)
-        actions.grid(row=7, column=0, sticky="ew", pady=(int(10 * s), 0))
-        self.copy_btn = ttk.Button(actions, text="Copy to clipboard", command=self.copy_transcript)
-        self.open_btn = ttk.Button(actions, text="Open transcript", command=lambda: self.open_output("txt"))
-        self.srt_btn = ttk.Button(actions, text="Open .srt", command=lambda: self.open_output("srt"))
-        self.folder_btn = ttk.Button(actions, text="Show in folder", command=self.show_in_folder)
-        for button in (self.copy_btn, self.open_btn, self.srt_btn, self.folder_btn):
-            button.pack(side="left", padx=(0, 8))
+        self.file_label.grid(row=0, column=1, sticky="w", padx=P(10))
+        actions = ttk.Frame(heading)
+        actions.grid(row=0, column=2, sticky="e")
+        self.open_btn = ttk.Button(actions, text="Open", compound="left", command=lambda: self.open_output("txt"))
+        self.srt_btn = ttk.Button(actions, text="Subtitles", compound="left", command=lambda: self.open_output("srt"))
+        self.folder_btn = ttk.Button(actions, text="Show in folder", compound="left", command=self.show_in_folder)
+        self.copy_btn = ttk.Button(actions, text="Copy", style="Accent.TButton", compound="left",
+                                   command=self.copy_transcript)
+        for button, icon, accent in ((self.open_btn, "open", False), (self.srt_btn, "captions", False),
+                                     (self.folder_btn, "folder", False), (self.copy_btn, "copy", True)):
+            button.pack(side="left", padx=(P(6), 0))
             button.state(["disabled"])
-        self.queue_label = ttk.Label(actions, style="Muted.TLabel")
-        self.queue_label.pack(side="right")
+            self._icon_buttons.append((button, icon, accent))
+
+        # -- transcript card
+        card = ttk.Frame(outer, style="Card.TFrame", padding=P(2))
+        card.grid(row=6, column=0, sticky="nsew")
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(0, weight=1)
+        self.text = tk.Text(card, wrap="word", relief="flat", bd=0, highlightthickness=0, padx=P(22), pady=P(18),
+                            spacing2=P(3), cursor="arrow", insertwidth=0, takefocus=False)
+        scroll = ttk.Scrollbar(card, command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.grid(row=0, column=0, sticky="nsew", padx=(P(2), 0), pady=P(2))
+        scroll.grid(row=0, column=1, sticky="ns", padx=(0, P(2)), pady=P(6))
+
+        # -- status bar
+        bar = ttk.Frame(outer)
+        bar.grid(row=7, column=0, sticky="ew", pady=(P(10), 0))
+        bar.columnconfigure(1, weight=1)
+        self.status_dot = tk.Canvas(bar, width=P(9), height=P(9), highlightthickness=0, bd=0)
+        self.status_dot.grid(row=0, column=0, padx=(P(2), P(8)))
+        self.status_label = ttk.Label(bar, style="Hint.TLabel")
+        self.status_label.grid(row=0, column=1, sticky="w")
+        self.queue_label = ttk.Label(bar, style="Hint.TLabel")
+        self.queue_label.grid(row=0, column=2, sticky="e")
 
         if self.dnd:
             for widget in (self.drop, self.text):
@@ -256,113 +490,227 @@ class App:
                 widget.dnd_bind("<<DropLeave>>", lambda e: self._drop_hover(e, False))
 
     def _build_banner(self, parent):
-        s = self.scale
-        self.banner = tk.Frame(parent, padx=int(12 * s), pady=int(8 * s))
+        P = self.look.px
+        self.banner = tk.Frame(parent, highlightthickness=1, bd=0, padx=P(14), pady=P(10))
         self.banner.columnconfigure(1, weight=1)
-        self.banner_icon = tk.Label(self.banner, font=("Segoe UI", 12))
-        self.banner_icon.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, int(10 * s)))
-        self.banner_title = tk.Label(self.banner, font=("Segoe UI Semibold", 10), anchor="w", justify="left")
+        self.banner_icon = tk.Label(self.banner, bd=0)
+        self.banner_icon.grid(row=0, column=0, rowspan=3, sticky="n", padx=(0, P(12)), pady=(P(2), 0))
+        self.banner_title = tk.Label(self.banner, font=self.look.fonts["strong"], anchor="w", justify="left", bd=0)
         self.banner_title.grid(row=0, column=1, sticky="ew")
-        self.banner_hint = tk.Label(self.banner, anchor="w", justify="left", fg=TEXT)
-        self.banner_hint.grid(row=1, column=1, sticky="ew", pady=(2, 0))
-        self.banner_actions = tk.Frame(self.banner)
-        self.banner_actions.grid(row=2, column=1, sticky="w", pady=(int(6 * s), 0))
-        self.banner_close = tk.Label(self.banner, text="✕", cursor="hand2", font=("Segoe UI", 10))
-        self.banner_close.grid(row=0, column=2, sticky="ne", padx=(int(10 * s), 0))
+        self.banner_hint = tk.Label(self.banner, font=self.look.fonts["body"], anchor="w", justify="left", bd=0)
+        self.banner_hint.grid(row=1, column=1, sticky="ew", pady=(P(2), 0))
+        self.banner_actions = tk.Frame(self.banner, bd=0)
+        self.banner_actions.grid(row=2, column=1, sticky="w", pady=(P(8), 0))
+        self.banner_close = tk.Label(self.banner, cursor="hand2", bd=0)
+        self.banner_close.grid(row=0, column=2, sticky="ne", padx=(P(10), 0))
         self.banner_close.bind("<Button-1>", lambda e: self.hide_banner())
         self.banner.bind("<Configure>", lambda e: self._wrap_banner(e.width))
 
     def _build_progress(self, parent):
-        s = self.scale
-        self.progress = ttk.Frame(parent)
+        P = self.look.px
+        self.progress = ttk.Frame(parent, style="Card.TFrame", padding=(P(18), P(14), P(18), P(14)))
         self.progress.columnconfigure(0, weight=1)
-        self.stage_label = ttk.Label(self.progress, style="Section.TLabel")
+        self.stage_label = ttk.Label(self.progress, style="Strong.TLabel", compound="left")
         self.stage_label.grid(row=0, column=0, sticky="w")
-        self.pct_label = ttk.Label(self.progress, style="Muted.TLabel")
+        self.pct_label = ttk.Label(self.progress, style="Strong.TLabel")
         self.pct_label.grid(row=0, column=1, sticky="e")
         self.bar = ttk.Progressbar(self.progress, maximum=100)
-        self.bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=int(6 * s))
+        self.bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(P(10), P(8)))
         self.time_label = ttk.Label(self.progress, style="Muted.TLabel")
         self.time_label.grid(row=2, column=0, sticky="w")
-        self.cancel_btn = ttk.Button(self.progress, text="Cancel", command=self.cancel)
+        self.cancel_btn = ttk.Button(self.progress, text="Cancel", compound="left", command=self.cancel)
         self.cancel_btn.grid(row=2, column=1, sticky="e")
-        self.progress.grid(row=4, column=0, sticky="ew", pady=(int(14 * s), 0))
+        self._icon_buttons.append((self.cancel_btn, "cancel", False))
+        self.progress.grid(row=4, column=0, sticky="ew", pady=(P(14), 0))
         self.progress.grid_remove()
 
-    def _draw_drop(self, active: bool = False):
-        c, s = self.drop, self.scale
+    # ------------------------------------------------------------ theme
+
+    def apply_theme(self, theme: str):
+        look = self.look
+        look.apply(theme)
+        p = self.p
+        self.logo_label.configure(image=look.logo(40))
+        for button, icon, accent in self._icon_buttons:
+            button.configure(image=look.button_image(icon, accent))
+        look.style_text(self.text)
+        self._style_transcript_tags()
+        self.drop.configure(bg=p["bg"])
+        self.status_dot.configure(bg=p["bg"])
+        self._draw_drop()
+        self._set_status(*self.status)
+        self._update_hints()
+        if self.banner_state:
+            self.show_banner(*self.banner_state)
+        if self.outputs:
+            self._render_transcript(self.transcript)
+        set_title_bar(self.root, theme == "dark", repaint=self.root.winfo_viewable())
+
+    def _style_transcript_tags(self):
+        fonts, p, P = self.look.fonts, self.p, self.look.px
+        t = self.text
+        t.tag_configure("doc_title", font=fonts["doc_title"], foreground=p["text"], spacing3=P(2))
+        t.tag_configure("meta", font=fonts["hint"], foreground=p["muted"], spacing3=P(14))
+        t.tag_configure("heading", spacing1=P(4))
+        t.tag_configure("stamp", font=fonts["stamp"], foreground=p["subtle"])
+        t.tag_configure("para", font=fonts["reading"], foreground=p["text"], spacing3=P(14))
+        t.tag_configure("placeholder_title", font=fonts["placeholder"], foreground=p["muted"], justify="center",
+                        spacing1=P(36), spacing3=P(6))
+        t.tag_configure("placeholder", font=fonts["body"], foreground=p["subtle"], justify="center")
+        for i, color in enumerate(p["speakers"]):
+            t.tag_configure(f"spk{i}", font=fonts["reading_strong"], foreground=color)
+
+    # ------------------------------------------------------------ drop zone
+
+    def _schedule_drop_redraw(self):
+        if self._drop_after is not None:
+            self.root.after_cancel(self._drop_after)
+        self._drop_after = self.root.after(30, self._draw_drop)
+
+    def _set_drop_state(self, state: str):
+        if state != self.drop_state:
+            self.drop_state = state
+            self._draw_drop()
+
+    def _draw_drop(self):
+        self._drop_after = None
+        c, p, look = self.drop, self.p, self.look
+        P = look.px
         c.delete("all")
         w, h = c.winfo_width(), c.winfo_height()
-        if w < 10:
+        if w < 20 or h < 20:
             return
-        _round_rect(c, 2, 2, w - 2, h - 2, int(14 * s), fill=ACCENT_SOFT if active else CARD,
-                    outline=ACCENT if active else BORDER, width=2 if active else 1)
-        title = "Release to transcribe" if active else "Drop audio or video files here"
-        c.create_text(w / 2, h / 2 - 13 * s, text=title, font=("Segoe UI Semibold", 14),
-                      fill=ACCENT if active else TEXT)
-        how = "or click to browse" if self.dnd else "click to choose files (drag-and-drop unavailable)"
-        c.create_text(w / 2, h / 2 + 17 * s, text=f"{how}  ·  wav, mp3, m4a, mp4 and more",
-                      font=("Segoe UI", 10), fill=MUTED)
+        state = self.drop_state
+        fill = p["surface_active"] if state == "drag" else p["surface"]
+        outline = p["accent"] if state in ("drag", "hover") else p["border"]
+        line = 2 if state == "drag" else 1
+        title = "Release to add" if state == "drag" else "Drop audio or video files"
+        how = "or click to browse" if self.dnd else "Click to choose files"
+        subtitle = f"{how}  \u00b7  MP3, WAV, M4A, MP4 and more  \u00b7  Ctrl+O"
+        title_font, sub_font = look.fonts["drop"], look.fonts["body"]
+
+        # Roomy and centred while the window is empty; a slim bar (glyph beside the text)
+        # once a transcript or a running job needs the space.
+        bars = (0.36, 0.66, 1.0, 0.56, 0.82, 0.42)
+        bar_w, gap = P(5), P(5)
+        compact = h < P(120)
+        tall = P(26 if compact else 30)
+        glyph_w = len(bars) * bar_w + (len(bars) - 1) * gap
+        if compact:
+            text_w = max(title_font.measure(title), sub_font.measure(subtitle))
+            left = (w - (glyph_w + P(22) + text_w)) / 2
+            glyph_x, glyph_y = left, h / 2
+            text_x, anchor = left + glyph_w + P(22), "w"
+            title_y, sub_y = h / 2 - P(12), h / 2 + P(13)
+        else:
+            glyph_x, glyph_y = (w - glyph_w) / 2, h / 2 - P(28)
+            text_x, anchor = w / 2, "center"
+            title_y, sub_y = h / 2 + P(12), h / 2 + P(38)
+
+        if Image is not None:
+            ss = 2  # supersample for smooth corners
+            img = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.rounded_rectangle((ss, ss, w * ss - ss - 1, h * ss - ss - 1), radius=P(14) * ss, fill=fill,
+                                outline=outline, width=max(1, P(line)) * ss)
+            x = glyph_x * ss
+            for frac in bars:
+                half = tall * ss * frac / 2
+                d.rounded_rectangle((x, glyph_y * ss - half, x + bar_w * ss, glyph_y * ss + half),
+                                    radius=bar_w * ss / 2, fill=p["accent"])
+                x += (bar_w + gap) * ss
+            self._drop_image = ImageTk.PhotoImage(img.resize((w, h), Image.LANCZOS), master=self.root)
+            c.create_image(0, 0, image=self._drop_image, anchor="nw")
+        else:
+            _round_rect(c, 2, 2, w - 2, h - 2, P(14), fill=fill, outline=outline, width=line)
+        c.create_text(text_x, title_y, text=title, font=title_font, anchor=anchor,
+                      fill=p["accent"] if state == "drag" else p["text"])
+        c.create_text(text_x, sub_y, text=subtitle, font=sub_font, anchor=anchor, fill=p["muted"])
+
+    def _update_drop_size(self):
+        compact = self.current is not None or bool(self.outputs)
+        height = self.look.px(92 if compact else 150)
+        if int(self.drop.cget("height")) != height:
+            self.drop.configure(height=height)  # <Configure> redraws it
 
     def _drop_hover(self, event, active: bool):
-        self._draw_drop(active)
+        self._set_drop_state("drag" if active else "idle")
         return event.action
 
     def _on_drop(self, event):
-        self._draw_drop(False)
+        self._set_drop_state("idle")
         self.add_files(self.root.tk.splitlist(event.data))
         return COPY
 
     # ------------------------------------------------------------ banner
 
     def show_banner(self, kind: str, title: str, hint: str = "", actions=()):
-        bg, fg, icon = BANNERS[kind]
-        self.banner_kind = kind
+        bg, fg = self.p["banners"][kind]
+        self.banner_state = (kind, title, hint, tuple(actions))
         for widget in (self.banner, self.banner_icon, self.banner_title, self.banner_hint,
                        self.banner_actions, self.banner_close):
             widget.configure(bg=bg)
-        self.banner_icon.configure(text=icon, fg=fg)
+        self.banner.configure(highlightbackground=fg, highlightcolor=fg)
+        self.banner_icon.configure(image=self.look.icon(kind, fg, 18))
+        close = self.look.icon("cancel", fg, 12)
+        self.banner_close.configure(image=close, text="" if close else "\u2715", fg=fg)
         self.banner_title.configure(text=title, fg=fg)
-        self.banner_close.configure(fg=fg)
-        self.banner_hint.configure(text=hint)
+        self.banner_hint.configure(text=hint, fg=self.p["text"])
         self.banner_hint.grid() if hint else self.banner_hint.grid_remove()
         for child in self.banner_actions.winfo_children():
             child.destroy()
         for label, callback in actions:
-            ttk.Button(self.banner_actions, text=label, command=callback).pack(side="left", padx=(0, 6))
+            ttk.Button(self.banner_actions, text=label, style=f"{kind.title()}.TButton",
+                       command=callback).pack(side="left", padx=(0, self.look.px(8)))
         self.banner_actions.grid() if actions else self.banner_actions.grid_remove()
-        self.banner.grid(row=3, column=0, sticky="ew", pady=(int(10 * self.scale), 0))
+        self.banner.grid(row=3, column=0, sticky="ew", pady=(self.look.px(14), 0))
 
     def hide_banner(self):
-        self.banner_kind = None
+        self.banner_state = None
         self.banner.grid_remove()
 
     def _wrap_banner(self, width):
-        wrap = max(width - int(90 * self.scale), 200)
+        wrap = max(width - self.look.px(110), 200)
         self.banner_title.configure(wraplength=wrap)
         self.banner_hint.configure(wraplength=wrap)
 
-    def show_details(self, title: str, text: str):
+    def _text_window(self, title: str, text: str = "", copy_text: str | None = None) -> tuple[tk.Toplevel, tk.Text]:
+        look, P = self.look, self.look.px
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(title)
-        win.geometry(f"{int(760 * self.scale)}x{int(460 * self.scale)}")
-        box = tk.Text(win, wrap="none", font=("Consolas", 9), relief="flat", padx=8, pady=8)
-        scroll = ttk.Scrollbar(win, command=box.yview)
+        win.configure(bg=self.p["bg"])
+        win.geometry(f"{P(780)}x{P(480)}")
+        frame = ttk.Frame(win, padding=P(14))
+        frame.pack(fill="both", expand=True)
+        footer = ttk.Frame(frame)
+        footer.pack(side="bottom", fill="x", pady=(P(10), 0))
+        if copy_text is not None:
+            ttk.Button(footer, text="Copy", style="Accent.TButton", image=look.button_image("copy", True),
+                       compound="left", command=lambda: self._to_clipboard(copy_text)).pack(side="right")
+        card = ttk.Frame(frame, style="Card.TFrame", padding=P(2))
+        card.pack(fill="both", expand=True)
+        box = tk.Text(card, wrap="none", relief="flat", bd=0, highlightthickness=0, padx=P(10), pady=P(8))
+        look.style_text(box, mono=True)
+        scroll = ttk.Scrollbar(card, command=box.yview)
         box.configure(yscrollcommand=scroll.set)
-        bar = ttk.Frame(win, padding=8)
-        bar.pack(side="bottom", fill="x")
-        ttk.Button(bar, text="Copy", command=lambda: self._to_clipboard(text)).pack(side="right")
         scroll.pack(side="right", fill="y")
         box.pack(fill="both", expand=True)
         box.insert("1.0", text)
         box.see("end")
+        set_title_bar(win, look.theme == "dark")
+        win.deiconify()
+        return win, box
+
+    def show_details(self, title: str, text: str):
+        _win, box = self._text_window(title, text, copy_text=text)
         box.configure(state="disabled")
 
     def _on_tk_error(self, exc_type, exc, tb):
         detail = "".join(traceback.format_exception(exc_type, exc, tb))
         self.show_banner("error", f"Unexpected problem in the app window: {exc}",
                          "The app is still running. Please try again.",
-                         [("Details…", lambda: self.show_details("Error details", detail))])
+                         [("Details\u2026", lambda: self.show_details("Error details", detail))])
 
     # ------------------------------------------------------------ setup checks
 
@@ -370,6 +718,7 @@ class App:
         missing = deps.missing_packages()
         if missing:
             self.setup_ok = False
+            self._set_status("Setup needed", "error")
             if deps.in_virtualenv():
                 self.show_banner("error", f"Setup needed: missing Python packages ({', '.join(missing)}).",
                                  "Click Install to download them (about 1 GB, one time).",
@@ -381,6 +730,7 @@ class App:
             return False
         if deps.ffmpeg_missing():
             self.setup_ok = False
+            self._set_status("Setup needed", "error")
             command = "winget install Gyan.FFmpeg"
             self.show_banner("error", "ffmpeg wasn't found. It's needed to read audio and video files.",
                              f"Install it from a terminal with:   {command}   then click Check again "
@@ -400,13 +750,9 @@ class App:
     def install_dependencies(self):
         if self.install_window is not None:
             return
-        win = self.install_window = tk.Toplevel(self.root)
-        win.title("Installing dependencies")
-        win.geometry(f"{int(760 * self.scale)}x{int(420 * self.scale)}")
-        self.install_log = tk.Text(win, wrap="none", font=("Consolas", 9), relief="flat", padx=8, pady=8)
-        self.install_log.pack(fill="both", expand=True)
         command = deps.install_command()
-        self.install_log.insert("end", "> " + " ".join(command) + "\n")
+        self.install_window, self.install_log = self._text_window("Installing dependencies",
+                                                                  "> " + " ".join(command) + "\n")
 
         def run():
             try:
@@ -422,7 +768,7 @@ class App:
             self.events.put((-1, {"event": "install_exit", "code": code}))
 
         threading.Thread(target=run, daemon=True).start()
-        self.show_banner("info", "Installing dependencies…", "This can take several minutes.")
+        self.show_banner("info", "Installing dependencies\u2026", "This can take several minutes.")
 
     def _install_event(self, event: dict):
         if event["event"] == "install_log" and self.install_window is not None:
@@ -466,11 +812,12 @@ class App:
             self.eta = None
             self._indeterminate(False)
             self.bar.configure(value=0)
-            self.stage_label.configure(text="Starting…")
+            self.stage_label.configure(text="Starting\u2026", image="")
             self.pct_label.configure(text="")
             self.time_label.configure(text="")
             self.cancel_btn.grid()
             self.progress.grid()
+            self._update_drop_size()
         if not worker.send(command):
             self.worker = None
             if meta is not None:
@@ -481,8 +828,12 @@ class App:
         self._update_queue_label()
         return self.command_id
 
+    def _quality(self) -> str:
+        label = self.quality_var.get()
+        return next((key for key, value in QUALITY_LABELS.items() if value == label), DEFAULT_QUALITY)
+
     def _common_fields(self, diarize: bool) -> dict:
-        return {"model": self.model_var.get(), "diarize": diarize, "quality": self.cfg.get("quality", DEFAULT_QUALITY),
+        return {"model": self.model_var.get(), "diarize": diarize, "quality": self._quality(),
                 "language": self.cfg["language"]}
 
     def warm_up(self):
@@ -495,7 +846,7 @@ class App:
         diarize = self.speakers_var.get() != NO_LABELS and (bool(self.cfg["hf_token"]) or self._diarization_ready())
         self.warm_id = self._dispatch({"cmd": "warm", **self._common_fields(diarize)}, None)
         if self.warm_id is not None:
-            self._set_status("Loading models in the background…")
+            self._set_status("Starting the speech engine\u2026", "busy")
 
     def _schedule_warm_up(self):
         if self.warm_timer is not None:
@@ -511,6 +862,14 @@ class App:
             self.worker = None
         self.warm_id = None
         self.warm_up()
+
+    def _ready_status(self):
+        model = self.model_var.get()
+        diarize = self.speakers_var.get() != NO_LABELS
+        offline = not missing_components(config.models_dir(self.cfg), model, diarize and bool(
+            self.cfg["hf_token"] or self._diarization_ready()))
+        where = "works offline" if offline else "the first file downloads the models"
+        self._set_status(f"Ready  \u00b7  {model} loaded  \u00b7  {where}", "ok")
 
     # ------------------------------------------------------------ queue + jobs
 
@@ -528,7 +887,7 @@ class App:
             (good if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS else bad).append(path)
         if bad:
             more = f" (and {len(bad) - 1} more)" if len(bad) > 1 else ""
-            self.show_banner("error", f"Can't transcribe “{bad[0].name}”{more}: not a supported audio or video file.",
+            self.show_banner("error", f"Can't transcribe \u201c{bad[0].name}\u201d{more}: not a supported audio or video file.",
                              "Supported: " + ", ".join(e.lstrip(".") for e in SUPPORTED_EXTS) + ".")
         self.pending.extend(good)
         self.start_next()
@@ -544,7 +903,7 @@ class App:
             self.show_banner(
                 "warning", "Speaker labels need a one-time model download with a free Hugging Face token.",
                 "Add your token in Settings, or transcribe without speaker labels for now.",
-                [("Add token…", self.open_settings),
+                [("Add token\u2026", self.open_settings),
                  ("Transcribe without labels", self._continue_without_labels),
                  ("Clear queue", self._clear_queue)])
             return
@@ -552,7 +911,7 @@ class App:
 
     def _continue_without_labels(self):
         self.speakers_var.set(NO_LABELS)
-        self._remember_choices()
+        self._choices_changed(rewarm=False)
         self.hide_banner()
         self.start_next()
 
@@ -570,10 +929,11 @@ class App:
             command["output_dir"] = self.cfg["output_dir"]
         if self.banner_kind in ("warning", "info", "success"):
             self.hide_banner()  # errors about an earlier file stay visible until dismissed
-        self.file_label.configure(text=source.name)
+        self.file_label.configure(text=f"\u00b7  {source.name}")
         self._set_result(None, "")
-        self._set_placeholder(f"Working on {source.name}…\nThe transcript will appear here when it's done.")
-        self._dispatch(command, {"kind": "transcribe", "source": source})
+        self._set_placeholder(f"Working on {source.name}\u2026", "The transcript will appear here when it's done.")
+        if self._dispatch(command, {"kind": "transcribe", "source": source}) is not None:
+            self._set_status(f"Transcribing {source.name}", "work")
 
     def start_prepare(self):
         if self.current is not None:
@@ -582,7 +942,8 @@ class App:
         if not self.setup_ok and not self.startup_checks():
             return
         diarize = bool(self.cfg["hf_token"]) or self._diarization_ready()
-        self._dispatch({"cmd": "prepare", **self._common_fields(diarize)}, {"kind": "prepare", "source": None})
+        if self._dispatch({"cmd": "prepare", **self._common_fields(diarize)}, {"kind": "prepare", "source": None}):
+            self._set_status("Downloading models", "work")
 
     def cancel(self):
         if self.current is None or self.worker is None:
@@ -593,7 +954,7 @@ class App:
             return
         self.current["cancelled"] = True
         self.pending.clear()
-        self.stage_label.configure(text="Cancelling…")
+        self.stage_label.configure(text="Cancelling\u2026")
         self.worker.kill()  # the exit event finishes the job; the next job starts a fresh worker
 
     # ------------------------------------------------------------ events
@@ -633,7 +994,7 @@ class App:
                 self._indeterminate(False)
                 self.bar.configure(value=value)
                 detail = event.get("detail")
-                self.pct_label.configure(text=f"{detail}  ·  {value:.0f}%" if detail else f"{value:.0f}%")
+                self.pct_label.configure(text=f"{detail}  \u00b7  {value:.0f}%" if detail else f"{value:.0f}%")
             eta = event.get("eta_s")
             self.eta = (eta, time.monotonic()) if eta is not None else None
         elif kind == "info":
@@ -647,11 +1008,15 @@ class App:
 
     def _handle_warm(self, event: dict):
         kind = event.get("event")
-        if kind == "stage":
-            self._set_status(event.get("label", ""))
+        if kind == "stage" and self.current is None:
+            self._set_status(event.get("label", ""), "busy")
         elif kind in ("warm_done", "error"):
             self.warm_id = None
-            self._set_status("Ready" if kind == "warm_done" else "")
+            if self.current is None:
+                if kind == "warm_done":
+                    self._ready_status()
+                else:
+                    self._set_status("Couldn't preload the models. They load with the first file instead.", "off")
 
     def _tick(self):
         if self.current is None:
@@ -660,15 +1025,15 @@ class App:
         if self.eta is not None:
             eta, received = self.eta
             left = eta - (time.monotonic() - received)
-            parts.append(human_eta(left) if left > 0 else "finishing up…")
+            parts.append(human_eta(left) if left > 0 else "finishing up\u2026")
         if self.current.get("duration"):
             parts.append(f"{human_duration(self.current['duration'])} of audio")
-        self.time_label.configure(text="   ·   ".join(parts))
+        self.time_label.configure(text="   \u00b7   ".join(parts))
 
     def _on_worker_exit(self, code):
         self.worker = None
         self.warm_id = None
-        self._set_status("")
+        self._set_status("Speech engine stopped. It restarts with the next file.", "off")
         if self.current is not None:
             self._finish(crashed=code)
 
@@ -677,9 +1042,12 @@ class App:
         self._indeterminate(False)
         self.cancel_btn.grid_remove()
         log = "\n".join(self.worker.log) if self.worker is not None else ""
+        if self.worker is not None and self.worker.alive:
+            self._ready_status()
         if job["cancelled"]:
             self.progress.grid_remove()
-            self._set_placeholder("Cancelled.")
+            self._set_placeholder("Cancelled", "Drop a file to start again.")
+            self._update_drop_size()
             self.show_banner("info", "Cancelled.")
         elif done is not None and job["kind"] == "prepare":
             self.progress.grid_remove()
@@ -691,7 +1059,8 @@ class App:
         else:
             self.progress.grid_remove()
             if job["kind"] == "transcribe":
-                self._set_placeholder("No transcript: see the message above.")
+                self._set_placeholder("No transcript", "See the message above.")
+            self._update_drop_size()
             self._show_error(error or {
                 "code": "WORKER_CRASHED",
                 "message": f"The transcription process stopped unexpectedly (exit code {crashed}).",
@@ -710,9 +1079,10 @@ class App:
         self.pct_label.configure(text="100%")
         speakers = (f"{done['speakers']} speaker{'s' if done['speakers'] != 1 else ''}"
                     if done.get("diarized") else "no speaker labels")
-        self.stage_label.configure(text=f"Done — {job['source'].name}")
-        self.time_label.configure(text=f"{human_duration(done['duration_s'])} of audio transcribed in "
-                                       f"{human_duration(done['elapsed_s'])}   ·   {speakers}   ·   "
+        self.stage_label.configure(text=f"  Transcribed {job['source'].name}",
+                                   image=self.look.icon("success", self.p["status"]["ok"]))
+        self.time_label.configure(text=f"{human_duration(done['duration_s'])} of audio in "
+                                       f"{human_duration(done['elapsed_s'])}   \u00b7   {speakers}   \u00b7   "
                                        f"saved in {short_path(Path(done['txt']).parent)}")
         self._set_result(done, text)
 
@@ -727,43 +1097,50 @@ class App:
             actions.append(("Open Settings", self.open_settings))
         details = "\n\n".join(part for part in (err.get("detail"), log) if part)
         if details:
-            actions.append(("Details…", lambda: self.show_details("Error details", details)))
+            actions.append(("Details\u2026", lambda: self.show_details("Error details", details)))
         self.show_banner("error", err.get("message", "Something went wrong."), err.get("hint", ""), actions)
 
     # ------------------------------------------------------------ transcript display
 
-    def _set_placeholder(self, message: str):
+    def _set_placeholder(self, title: str, message: str = ""):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
-        self.text.insert("1.0", message, "placeholder")
+        self.text.insert("1.0", title + "\n", "placeholder_title")
+        if message:
+            self.text.insert("end", message, "placeholder")
         self.text.configure(state="disabled")
 
     def _set_result(self, done: dict | None, text: str):
         self.outputs, self.transcript = (done or {}), text
         for button in (self.copy_btn, self.open_btn, self.srt_btn, self.folder_btn):
             button.state(["!disabled"] if done else ["disabled"])
-        if not done:
-            return
+        if done:
+            self._render_transcript(text)
+        self._update_drop_size()
+
+    def _render_transcript(self, text: str):
         box = self.text
         box.configure(state="normal")
         box.delete("1.0", "end")
         colors: dict[str, str] = {}
-        in_header = True
-        for line in text.splitlines():
-            if in_header:
-                if line:
-                    box.insert("end", line + "\n", "meta")
-                    continue
-                in_header = False
+        lines = text.splitlines()
+        body_start = lines.index("") + 1 if "" in lines[:4] else 0
+        for i, line in enumerate(lines[:body_start]):
+            if line:
+                box.insert("end", line + "\n", "doc_title" if i == 0 else "meta")
+        for line in lines[body_start:]:
+            if not line:
+                continue
             match = HEADING_RE.match(line)
             if match:
                 name = match.group("speaker")
                 if name:
-                    tag = colors.setdefault(name, f"spk{len(colors) % len(SPEAKER_COLORS)}")
-                    box.insert("end", name + "  ", tag)
-                box.insert("end", match.group("stamp") + "\n", "stamp")
+                    tag = colors.setdefault(name, f"spk{len(colors) % SPEAKER_TAGS}")
+                    box.insert("end", name, (tag, "heading"))
+                    box.insert("end", "   ", "heading")
+                box.insert("end", match.group("stamp").strip("[]") + "\n", ("stamp", "heading"))
             else:
-                box.insert("end", line + "\n")
+                box.insert("end", line + "\n", "para")
         box.configure(state="disabled")
         box.yview_moveto(0)
 
@@ -776,8 +1153,8 @@ class App:
         if not self.transcript:
             return
         self._to_clipboard(self.transcript)
-        self.copy_btn.configure(text="Copied ✔")
-        self.root.after(1500, lambda: self.copy_btn.configure(text="Copy to clipboard"))
+        self.copy_btn.configure(text="Copied", image=self.look.button_image("check", True))
+        self.root.after(1500, lambda: self.copy_btn.configure(text="Copy", image=self.look.button_image("copy", True)))
 
     def _output_path(self, kind: str) -> Path | None:
         path = Path(self.outputs.get(kind, ""))
@@ -810,9 +1187,13 @@ class App:
             self.bar.stop()
             self.bar.configure(mode="determinate")
 
-    def _set_status(self, text: str):
-        self.status = text
-        self._update_queue_label()
+    def _set_status(self, text: str, kind: str = "ok"):
+        self.status = (text, kind)
+        self.status_label.configure(text=text)
+        size = self.look.px(9)
+        self.status_dot.delete("all")
+        color = self.p["status"].get(kind, self.p["status"]["off"])
+        self.status_dot.create_oval(1, 1, size - 1, size - 1, fill=color, outline=color)
 
     def _update_queue_label(self):
         count = len(self.pending)
@@ -820,21 +1201,36 @@ class App:
             text = (f"{count} more file{'s' if count != 1 else ''} queued" if self.current is not None
                     else f"{count} file{'s' if count != 1 else ''} waiting")
         else:
-            text = self.status
+            text = ""
         self.queue_label.configure(text=text)
 
-    def _update_model_hint(self):
+    def _update_hints(self):
         self.model_hint.configure(text=MODEL_HINTS.get(self.model_var.get(), ""))
+        self.speakers_hint.configure(text=speaker_hint(self.speakers_var.get()))
+        self.quality_hint.configure(text=QUALITY_HINTS[self._quality()])
+        self.estimate_value.configure(text=self._estimate_text())
 
-    def _model_changed(self):
-        self._remember_choices()
-        self._schedule_warm_up()
+    def _estimate_text(self) -> str:
+        """Processing time for one hour of audio with the current choices, from this PC's measured speeds."""
+        try:
+            job = Job(source=Path("estimate"), model=self.model_var.get(), quality=self._quality(),
+                      diarize=self.speakers_var.get() != NO_LABELS)
+            rates = {s.key: s.estimate for s in plan_stages(job, 3600, load_calibration()) if s.per_audio_second}
+        except Exception:
+            return "\u2014"
+        main = rates.get("transcribe", 0) + rates.get("align", 0)
+        total = max(main, rates.get("diarize", 0))  # speaker detection runs alongside transcription
+        minutes = max(1, round(total / 60))
+        return f"\u2248 {minutes} min" if minutes < 60 else f"\u2248 {minutes // 60} h {minutes % 60:02d} min"
 
-    def _remember_choices(self):
-        self._update_model_hint()
+    def _choices_changed(self, rewarm: bool):
         self.cfg["model"] = self.model_var.get()
         self.cfg["speakers"] = self.speakers_var.get()
+        self.cfg["quality"] = self._quality()
+        self._update_hints()
         self._save_config()
+        if rewarm or self.speakers_var.get() != NO_LABELS:
+            self._schedule_warm_up()
 
     def _save_config(self) -> bool:
         try:
@@ -847,9 +1243,12 @@ class App:
     def open_settings(self, welcome: bool = False):
         SettingsDialog(self, welcome)
 
-    def on_settings_saved(self, threads_changed: bool = False):
+    def on_settings_saved(self, threads_changed: bool = False, theme_changed: bool = False):
+        if theme_changed:
+            self.apply_theme(resolve_theme(self.cfg.get("theme", "system")))
         if self.banner_kind == "warning" and self.pending:
             self.hide_banner()
+        self._update_hints()
         if threads_changed:
             self._restart_worker()
         elif not self.pending:
@@ -869,118 +1268,143 @@ class App:
 class SettingsDialog(tk.Toplevel):
     def __init__(self, app: App, welcome: bool):
         super().__init__(app.root)
+        self.withdraw()  # build hidden, then show centred: no flicker
         self.app, self.welcome = app, welcome
-        cfg, s = app.cfg, app.scale
+        look, cfg = app.look, app.cfg
+        P = look.px
         self.title(f"Welcome to {APP_NAME}" if welcome else "Settings")
-        self.configure(bg=BG)
+        self.configure(bg=look.p["bg"])
         self.transient(app.root)
         self.resizable(False, False)
-        wrap = int(500 * s)
 
-        body = ttk.Frame(self, padding=int(20 * s))
+        body = ttk.Frame(self, padding=(P(26), P(22), P(26), P(20)))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(1, weight=1)
-        row = 0
+        body.columnconfigure((0, 1), weight=1, uniform="col")
+        wrap = P(360)
 
-        def section(title, top=16):
-            nonlocal row
-            ttk.Label(body, text=title, style="Section.TLabel").grid(
-                row=row, column=0, columnspan=3, sticky="w", pady=(int(top * s), int(4 * s)))
-            row += 1
-
-        def note(text, style="Muted.TLabel"):
-            nonlocal row
-            ttk.Label(body, text=text, style=style, wraplength=wrap, justify="left").grid(
-                row=row, column=0, columnspan=3, sticky="w", pady=(0, int(4 * s)))
-            row += 1
-
+        hero = ttk.Frame(body)
+        hero.grid(row=0, column=0, columnspan=2, sticky="ew")
+        hero.columnconfigure(1, weight=1)
         if welcome:
-            ttk.Label(body, text="Welcome!", style="Title.TLabel").grid(row=row, column=0, columnspan=3, sticky="w")
-            row += 1
-            note("Transcription works right away. Speaker labels (Speaker 1, Speaker 2…) use the free "
-                 "pyannote model, which needs a Hugging Face access token for a one-time download.", "TLabel")
+            ttk.Label(hero, image=look.logo(48)).grid(row=0, column=0, rowspan=2, padx=(0, P(14)))
+            ttk.Label(hero, text=f"Welcome to {APP_NAME}", style="Title.TLabel").grid(row=0, column=1, sticky="sw")
+            ttk.Label(hero, text="Transcription works right away. Speaker labels (Speaker 1, Speaker 2\u2026) use the "
+                                 "free pyannote model, which needs a Hugging Face access token for a one-time download.",
+                      style="Muted.TLabel", wraplength=P(560), justify="left").grid(row=1, column=1, sticky="nw")
+        else:
+            ttk.Label(hero, text="Settings", style="Title.TLabel").grid(row=0, column=0, sticky="w")
 
-        section("Speaker labels", top=8 if welcome else 0)
-        for text, url, button in (
-                ("1.  Create a free Hugging Face account and a token with “Read” access", TOKENS_URL, "Token page"),
-                ("2.  Accept the conditions of pyannote/speaker-diarization-community-1", DIARIZATION_URL, "Model page")):
-            ttk.Label(body, text=text, wraplength=int(390 * s), justify="left").grid(row=row, column=0, columnspan=2, sticky="w", pady=2)
-            ttk.Button(body, text=button, command=lambda u=url: webbrowser.open(u)).grid(row=row, column=2, sticky="e", padx=(8, 0))
-            row += 1
-        ttk.Label(body, text="3.  Paste the token:").grid(row=row, column=0, sticky="w", pady=(6, 2))
+        def card(column, row, title):
+            frame = ttk.Frame(body)
+            frame.grid(row=row, column=column, sticky="nsew", padx=(0, P(16)) if column == 0 and not welcome else 0,
+                       pady=(P(18), 0))
+            frame.columnconfigure(0, weight=1)
+            ttk.Label(frame, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, P(8)))
+            inner = ttk.Frame(frame, style="Card.TFrame", padding=(P(16), P(12), P(16), P(14)))
+            inner.grid(row=1, column=0, sticky="nsew")
+            inner.columnconfigure(1, weight=1)
+            frame.rowconfigure(1, weight=1)
+            return inner
+
+        def note(parent, row, text, columnspan=3):
+            label = ttk.Label(parent, text=text, style="Hint.TLabel", wraplength=wrap, justify="left")
+            label.grid(row=row, column=0, columnspan=columnspan, sticky="w", pady=(P(6), 0))
+            return label
+
+        # -- speaker labels (both modes)
+        speakers = card(0, 1, "Speaker labels")
+        if welcome:
+            speakers.master.grid_configure(columnspan=2)
+        steps = (("1.  Create a free Hugging Face token with \u201cRead\u201d access", TOKENS_URL, "Token page"),
+                 ("2.  Accept the conditions of pyannote/speaker-diarization-community-1", DIARIZATION_URL, "Model page"))
+        for row, (text, url, button) in enumerate(steps):
+            ttk.Label(speakers, text=text, wraplength=P(270 if not welcome else 420), justify="left").grid(
+                row=row, column=0, columnspan=2, sticky="w", pady=P(3))
+            ttk.Button(speakers, text=button, image=look.button_image("link"), compound="left",
+                       command=lambda u=url: webbrowser.open(u)).grid(row=row, column=2, sticky="e", padx=(P(10), 0))
+        ttk.Label(speakers, text="3.  Paste the token").grid(row=2, column=0, columnspan=3, sticky="w", pady=(P(8), P(4)))
         self.token_var = tk.StringVar(value=cfg["hf_token"])
-        self.token_entry = ttk.Entry(body, textvariable=self.token_var, show="•", width=44)
-        self.token_entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=(6, 2))
+        self.token_entry = ttk.Entry(speakers, textvariable=self.token_var, show="\u2022")
+        self.token_entry.grid(row=3, column=0, columnspan=2, sticky="ew")
         self.show_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="Show", variable=self.show_var,
-                        command=lambda: self.token_entry.configure(show="" if self.show_var.get() else "•")
-                        ).grid(row=row, column=2, sticky="e", padx=(8, 0), pady=(6, 2))
-        row += 1
-        status = ("Speaker model: downloaded ✔ (the token is no longer needed for it)"
-                  if app._diarization_ready() else "Speaker model: not downloaded yet")
-        note("The token is stored only in config.json in the app folder and is sent only to huggingface.co "
-             f"to download the model. Your audio never leaves this PC.\n{status}")
+        ttk.Checkbutton(speakers, text="Show", variable=self.show_var, style="Switch.TCheckbutton",
+                        command=lambda: self.token_entry.configure(show="" if self.show_var.get() else "\u2022")
+                        ).grid(row=3, column=2, sticky="e", padx=(P(10), 0))
+        ready = app._diarization_ready()
+        status = ttk.Label(speakers, text=("  Speaker model downloaded. The token isn't needed any more."
+                                           if ready else "  Speaker model not downloaded yet."),
+                           image=look.icon("success" if ready else "info",
+                                           look.p["status"]["ok"] if ready else look.p["muted"], 14),
+                           compound="left", style="Hint.TLabel")
+        status.grid(row=4, column=0, columnspan=3, sticky="w", pady=(P(10), 0))
+        note(speakers, 5, "Stored only in config.json in the app folder and sent only to huggingface.co, for that "
+                          "one download. Your audio never leaves this PC.").configure(wraplength=P(560 if welcome else 360))
 
         if not welcome:
-            section("Transcript files")
+            # -- appearance (left column, under speaker labels)
+            appearance = card(0, 2, "Appearance")
+            ttk.Label(appearance, text="Theme").grid(row=0, column=0, sticky="w")
+            self.theme_var = tk.StringVar(value=THEME_LABELS.get(cfg.get("theme", "system"), THEME_LABELS["system"]))
+            ttk.Combobox(appearance, textvariable=self.theme_var, values=list(THEME_LABELS.values()),
+                         state="readonly", width=16).grid(row=0, column=1, sticky="e")
+            note(appearance, 1, "Match Windows follows your light/dark setting in Windows Personalization.")
+
+            # -- transcript files (right column)
+            files = card(1, 1, "Transcript files")
             self.mode_var = tk.StringVar(value=cfg["output_mode"])
-            ttk.Radiobutton(body, text="Save next to the original file", value="source",
-                            variable=self.mode_var).grid(row=row, column=0, columnspan=3, sticky="w")
-            row += 1
-            ttk.Radiobutton(body, text="Save in this folder:", value="folder",
-                            variable=self.mode_var).grid(row=row, column=0, sticky="w")
+            ttk.Radiobutton(files, text="Save next to the original file", value="source",
+                            variable=self.mode_var).grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Radiobutton(files, text="Save in this folder:", value="folder",
+                            variable=self.mode_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(P(6), P(6)))
             self.dir_var = tk.StringVar(value=cfg["output_dir"])
-            ttk.Entry(body, textvariable=self.dir_var).grid(row=row, column=1, sticky="ew", padx=(8, 0))
-            ttk.Button(body, text="Browse…", command=self._browse_output).grid(row=row, column=2, sticky="e", padx=(8, 0))
-            row += 1
+            ttk.Entry(files, textvariable=self.dir_var).grid(row=2, column=0, columnspan=2, sticky="ew")
+            ttk.Button(files, text="Browse\u2026", image=look.button_image("folder"), compound="left",
+                       command=self._browse_output).grid(row=2, column=2, sticky="e", padx=(P(10), 0))
+            note(files, 3, "Each recording produces .txt, .srt and .vtt files.")
 
-            section("Transcription")
-            ttk.Label(body, text="Speed vs accuracy").grid(row=row, column=0, sticky="w", pady=2)
-            quality = cfg.get("quality") if cfg.get("quality") in QUALITY else DEFAULT_QUALITY
-            self.quality_var = tk.StringVar(value=QUALITY_LABELS[quality])
-            ttk.Combobox(body, textvariable=self.quality_var, values=list(QUALITY_LABELS.values()),
-                         state="readonly", width=24).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
-            row += 1
-            note("Fastest: greedy decoding and coarser speaker scanning. Most accurate: the slow library "
-                 "defaults. Balanced keeps the accuracy of the defaults where it measurably matters.")
-            ttk.Label(body, text="Language (multilingual models)").grid(row=row, column=0, sticky="w", pady=2)
+            # -- transcription
+            tuning = card(1, 2, "Transcription")
+            ttk.Label(tuning, text="Language (large-v3 only)").grid(row=0, column=0, sticky="w")
             self.language_var = tk.StringVar(value="Auto-detect" if cfg["language"] == "auto" else "English")
-            ttk.Combobox(body, textvariable=self.language_var, values=["English", "Auto-detect"],
-                         state="readonly", width=14).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
-            row += 1
-            ttk.Label(body, text="CPU threads").grid(row=row, column=0, sticky="w", pady=2)
+            ttk.Combobox(tuning, textvariable=self.language_var, values=["English", "Auto-detect"],
+                         state="readonly", width=14).grid(row=0, column=1, columnspan=2, sticky="e")
+            ttk.Label(tuning, text="CPU threads").grid(row=1, column=0, sticky="w", pady=(P(8), 0))
             self.threads_var = tk.StringVar(value=str(cfg["threads"] or 0))
-            ttk.Spinbox(body, from_=0, to=os.cpu_count() or 16, textvariable=self.threads_var, width=6
-                        ).grid(row=row, column=1, sticky="w", padx=(8, 0), pady=2)
-            row += 1
-            note(f"0 = automatic ({max(4, (os.cpu_count() or 6) - 2)} on this PC).")
+            ttk.Spinbox(tuning, from_=0, to=os.cpu_count() or 16, textvariable=self.threads_var, width=6
+                        ).grid(row=1, column=1, columnspan=2, sticky="e", pady=(P(8), 0))
+            note(tuning, 2, f"0 = automatic ({max(4, (os.cpu_count() or 6) - 2)} on this PC).")
 
-            section("Models")
+            # -- models (full width)
+            models = card(0, 3, "Models")
+            models.master.grid_configure(columnspan=2, padx=0)
             models_dir = config.models_dir(cfg)
-            note(f"Stored in {models_dir}")
-            buttons = ttk.Frame(body)
-            buttons.grid(row=row, column=0, columnspan=3, sticky="w")
-            row += 1
-            ttk.Button(buttons, text="Open models folder",
+            ttk.Label(models, text=str(models_dir), style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Button(models, text="Open folder", image=look.button_image("folder"), compound="left",
                        command=lambda: (models_dir.mkdir(parents=True, exist_ok=True), os.startfile(models_dir))
-                       ).pack(side="left", padx=(0, 8))
-            ttk.Button(buttons, text="Download models now", command=lambda: self._save(then=app.start_prepare)
-                       ).pack(side="left")
-            note("Downloads the selected speech model plus the timing and speaker models, so the app "
-                 "works with no internet connection afterwards.")
+                       ).grid(row=0, column=1, sticky="e", padx=(P(10), 0))
+            ttk.Button(models, text="Download models now", image=look.button_image("download"), compound="left",
+                       command=lambda: self._save(then=app.start_prepare)).grid(row=0, column=2, sticky="e",
+                                                                                 padx=(P(8), 0))
+            note(models, 1, "Downloads the selected speech model plus the timing and speaker models, so the app works "
+                            "with no internet connection afterwards.").configure(wraplength=P(720))
 
         footer = ttk.Frame(body)
-        footer.grid(row=row, column=0, columnspan=3, sticky="e", pady=(int(18 * s), 0))
-        ttk.Button(footer, text="Save", command=self._save).pack(side="right")
+        footer.grid(row=9, column=0, columnspan=2, sticky="e", pady=(P(22), 0))
+        ttk.Button(footer, text="Save token" if welcome else "Save", style="Accent.TButton",
+                   command=self._save).pack(side="right")
         ttk.Button(footer, text="Skip for now" if welcome else "Cancel", command=self._dismiss
-                   ).pack(side="right", padx=(0, 8))
+                   ).pack(side="right", padx=(0, P(8)))
         self.protocol("WM_DELETE_WINDOW", self._dismiss)
         self.bind("<Escape>", lambda e: self._dismiss())
+        self.bind("<Return>", lambda e: self._save())
 
+        set_title_bar(self, look.theme == "dark")
         self.update_idletasks()
-        x = app.root.winfo_rootx() + (app.root.winfo_width() - self.winfo_width()) // 2
-        y = app.root.winfo_rooty() + max((app.root.winfo_height() - self.winfo_height()) // 3, 0)
+        root = app.root
+        x = root.winfo_rootx() + (root.winfo_width() - self.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + max((root.winfo_height() - self.winfo_reqheight()) // 3, 0)
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
         self.grab_set()
         self.token_entry.focus_set()
 
@@ -1000,7 +1424,7 @@ class SettingsDialog(tk.Toplevel):
         cfg = dict(self.app.cfg)
         token = self.token_var.get().strip()
         if token and not token.startswith("hf_") and not messagebox.askyesno(
-                APP_NAME, "Hugging Face access tokens start with “hf_”. Save this value anyway?", parent=self):
+                APP_NAME, "Hugging Face access tokens start with \u201chf_\u201d. Save this value anyway?", parent=self):
             return
         cfg["hf_token"] = token
         cfg["token_prompt_done"] = True
@@ -1012,18 +1436,19 @@ class SettingsDialog(tk.Toplevel):
             cfg["output_mode"] = self.mode_var.get()
             cfg["output_dir"] = self.dir_var.get().strip()
             cfg["language"] = "auto" if self.language_var.get() == "Auto-detect" else "en"
-            cfg["quality"] = next((k for k, v in QUALITY_LABELS.items() if v == self.quality_var.get()), DEFAULT_QUALITY)
+            cfg["theme"] = next((k for k, v in THEME_LABELS.items() if v == self.theme_var.get()), "system")
             try:
                 cfg["threads"] = max(0, int(self.threads_var.get() or 0))
             except ValueError:
                 messagebox.showerror(APP_NAME, "CPU threads must be a whole number (0 = automatic).", parent=self)
                 return
         threads_changed = cfg["threads"] != self.app.cfg["threads"]
+        theme_changed = cfg.get("theme") != self.app.cfg.get("theme")
         self.app.cfg.update(cfg)
         if not self.app._save_config():
             return
         self.destroy()
-        self.app.on_settings_saved(threads_changed)
+        self.app.on_settings_saved(threads_changed, theme_changed)
         if then:
             then()
 
@@ -1036,7 +1461,17 @@ def _enable_dpi_awareness():
             pass
 
 
+def _set_app_id():
+    """Give the process its own taskbar identity (otherwise Windows groups it under pythonw.exe)."""
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+        except (AttributeError, OSError):
+            pass
+
+
 def main():
+    _set_app_id()
     _enable_dpi_awareness()
     root, dnd = None, False
     if TkinterDnD is not None:
@@ -1046,6 +1481,7 @@ def main():
             root = None
     if root is None:
         root = tk.Tk()
+    root.withdraw()  # finish styling (incl. the dark title bar) before the first paint
     icon = env.APP_DIR / "assets" / "app.ico"
     if icon.exists():
         try:
@@ -1053,4 +1489,5 @@ def main():
         except tk.TclError:
             pass
     App(root, dnd)
+    root.deiconify()
     root.mainloop()

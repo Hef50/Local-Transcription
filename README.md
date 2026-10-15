@@ -10,7 +10,8 @@ diarization). No cloud services, no paid API keys, no per-use limits.
 1. **Prerequisites:** 64-bit Python 3.10–3.13 and ffmpeg (`winget install Gyan.FFmpeg`).
 2. **Double-click `run.bat`.** The first launch runs `setup.ps1`, which creates `.venv`
    in this folder and installs the pinned packages (about 1 GB to download, about 5 GB on disk).
-   `create_shortcut.ps1` makes a shortcut you can pin to the taskbar.
+   `create_shortcut.ps1` makes a shortcut you can pin to the taskbar. It carries the app's taskbar
+   identity, so the running window shows up on the pinned icon rather than as a separate Python button.
 3. **Welcome dialog:** paste a Hugging Face token to turn on speaker labels, or skip.
    1. Create a free token with *Read* access: https://huggingface.co/settings/tokens
    2. Accept the model conditions: https://huggingface.co/pyannote/speaker-diarization-community-1
@@ -41,6 +42,19 @@ Not in the repo, by design: `config.json` (holds your Hugging Face token), `cali
 (per-machine speed measurements), `models\`, `.venv\` and `.cache\`. Paste the token again
 in the welcome dialog on the new machine. If `setup.ps1` is blocked by PowerShell's execution
 policy, run it as `powershell -ExecutionPolicy Bypass -File setup.ps1`.
+
+## The window
+
+Windows 11 look via the [Sun Valley ttk theme](https://github.com/rdbende/Sun-Valley-ttk-theme): follows
+your Windows light/dark setting (or pick one in Settings → Appearance), Fluent icons, dark title bar.
+
+* **Model / Speakers / Speed** sit at the top with a live *estimated time per hour of audio*, computed
+  from the speeds this PC has actually measured.
+* **Drop zone:** large when the window is empty, a slim bar while a file is working or a transcript is shown.
+* **Progress card:** both parallel stages, percent, elapsed, time left, Cancel.
+* **Transcript:** speaker names in colour, timestamps, Open / Subtitles / Show in folder / Copy.
+* **Status bar:** whether the speech engine is loaded and whether the next file can run fully offline.
+* `Ctrl+O` opens the file picker.
 
 ## Command line
 
@@ -88,7 +102,7 @@ recording. Numbers are processing time as a multiple of audio length; lower is f
 | Per-file start-up | ~30 s imports + ~8 s model loads | **~0 s** | ~0 s | one warm worker process keeps models loaded |
 | **5-minute file, with speakers** | **~9.7 min** | **5.2 min** (4.7 min after the first file) | | measured end to end |
 
-Pick the preset in Settings → *Speed vs accuracy*. "Most accurate" keeps pyannote's default
+Pick the preset from the **Speed** menu on the main window. "Most accurate" keeps pyannote's default
 diarization window (0.1) and costs about 3× more diarization time than Balanced.
 
 The app refines its ETA while it runs and stores measured speeds in `calibration.json`
@@ -148,7 +162,7 @@ run.bat -> app.py (Tkinter + tkinterdnd2 window)
 | `recpipe/pipeline.py` | WhisperX stages, presets, downloads, parallel diarization, progress/ETA |
 | `recpipe/formats.py` | .txt / .srt / .vtt rendering (pure Python, unit-tested) |
 | `recpipe/errors.py` | exception -> friendly message + hint |
-| `recpipe/gui.py` | window, settings, queue, warm worker management |
+| `recpipe/gui.py` | window (Sun Valley / Windows 11 theme, light + dark), settings, queue, warm worker |
 | `recpipe/env.py` | cache locations, telemetry off, offline mode |
 | `recpipe/config.py`, `deps.py` | settings file; first-run dependency checks |
 | `tests/` | `.venv\Scripts\python.exe -m unittest discover tests` |

@@ -16,6 +16,7 @@ PACKAGES = {  # import name -> pip name
     "torch": "torch",
     "torchaudio": "torchaudio",
     "nltk": "nltk",
+    "sv_ttk": "sv-ttk",
 }
 
 

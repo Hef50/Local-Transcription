@@ -2,3 +2,4 @@
 # PyPI's Windows torch wheels are CPU builds, which is what we want here.
 whisperx==3.8.6
 tkinterdnd2==0.6.3
+sv-ttk==2.6.1  # Windows 11 style theme for the window

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -267,8 +268,14 @@ def output_paths(source: Path, out_dir: Path) -> dict[str, Path]:
     return {kind: Path(out_dir) / f"{stem}.transcript.{kind}" for kind in ("txt", "srt", "vtt")}
 
 
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_outputs(result: dict, source: Path, out_dir: Path, *, model: str, duration: float,
-                  label_speakers: bool) -> tuple[dict[str, Path], int]:
+                  label_speakers: bool, subtitles: bool = True) -> tuple[dict[str, Path], int]:
     segments = normalize(result, label_speakers)
     speakers = len({s.speaker for s in segments if s.speaker and s.speaker != UNKNOWN_SPEAKER})
     who = (f"{speakers} speaker{'s' if speakers != 1 else ''}" if label_speakers
@@ -278,11 +285,134 @@ def write_outputs(result: dict, source: Path, out_dir: Path, *, model: str, dura
         f"{human_duration(duration)} of audio · model {model} · {who} · "
         f"{datetime.now():%Y-%m-%d %H:%M}",
     ]
-    cues = build_cues(segments)
-    contents = {"txt": render_txt(segments, header), "srt": render_srt(cues), "vtt": render_vtt(cues)}
-    paths = output_paths(source, out_dir)
+    contents = {"txt": render_txt(segments, header)}
+    if subtitles:
+        cues = build_cues(segments)
+        contents.update(srt=render_srt(cues), vtt=render_vtt(cues))
+    paths = {kind: path for kind, path in output_paths(source, out_dir).items() if kind in contents}
     for kind, path in paths.items():
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(contents[kind], encoding="utf-8")
-        os.replace(tmp, path)
+        _write_atomic(path, contents[kind])
     return paths, speakers
+
+
+# ---------------------------------------------------------------- naming speakers afterwards
+
+SPEAKER_HEADING_RE = re.compile(
+    r"^(?P<name>[^\[\]\n]+?) \[(?P<start>\d{2}:\d{2}(?::\d{2})?) - (?P<end>\d{2}:\d{2}(?::\d{2})?)\]$")
+CUE_LABEL_RE = re.compile(r"^\[(?P<name>[^\[\]\n]+)\] ")
+SPEAKER_COUNT_RE = re.compile(r"\b\d+ speakers?\b")
+MAX_NAME_LENGTH = 60
+
+
+@dataclass
+class SpeakerSummary:
+    name: str
+    turns: int = 0
+    seconds: float = 0.0
+    sample: str = ""  # what they said in their longest turn
+    sample_start: float = 0.0
+    sample_end: float = 0.0
+
+
+def parse_clock(text: str) -> float:
+    seconds = 0
+    for part in text.split(":"):
+        seconds = seconds * 60 + int(part)
+    return float(seconds)
+
+
+def speakers_in(txt: str) -> list[SpeakerSummary]:
+    """Speakers in a .txt transcript, in order of first appearance, with a representative turn each."""
+    lines = txt.splitlines()
+    found: dict[str, SpeakerSummary] = {}
+    for i, line in enumerate(lines):
+        match = SPEAKER_HEADING_RE.match(line)
+        if not match:
+            continue
+        start, end = parse_clock(match["start"]), parse_clock(match["end"])
+        summary = found.setdefault(match["name"], SpeakerSummary(match["name"]))
+        summary.turns += 1
+        summary.seconds += end - start
+        if not summary.sample or end - start > summary.sample_end - summary.sample_start:
+            summary.sample = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            summary.sample_start, summary.sample_end = start, end
+    return list(found.values())
+
+
+def name_problem(name: str) -> str | None:
+    """Why a typed speaker name can't be used, or None if it's fine."""
+    if any(ch in name for ch in "[]\n\r"):
+        return "Names can't contain square brackets or line breaks."
+    if len(name) > MAX_NAME_LENGTH:
+        return f"Names can be at most {MAX_NAME_LENGTH} characters."
+    return None
+
+
+def rename_txt(txt: str, mapping: dict[str, str]) -> str:
+    lines = txt.splitlines()
+    names = []
+    for i, line in enumerate(lines):
+        match = SPEAKER_HEADING_RE.match(line)
+        if match:
+            name = mapping.get(match["name"], match["name"])
+            names.append(name)
+            lines[i] = f"{name} [{match['start']} - {match['end']}]"
+    # Giving two voices the same name merges them, so recount for the header line.
+    count = len(set(names))
+    for i in range(min(3, len(lines))):
+        if SPEAKER_COUNT_RE.search(lines[i]):
+            lines[i] = SPEAKER_COUNT_RE.sub(f"{count} speaker{'s' if count != 1 else ''}", lines[i], count=1)
+            break
+    return "\n".join(lines) + ("\n" if txt.endswith("\n") else "")
+
+
+def rename_subtitles(text: str, mapping: dict[str, str]) -> str:
+    """Rename the [Speaker N] prefix on each .srt/.vtt cue and re-wrap the cue to two lines."""
+    blocks = text.rstrip("\n").split("\n\n")
+    for b, block in enumerate(blocks):
+        lines = block.split("\n")
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing is None or timing + 1 >= len(lines):
+            continue
+        body = " ".join(line.strip() for line in lines[timing + 1:] if line.strip())
+        match = CUE_LABEL_RE.match(body)
+        if match and match["name"] in mapping:
+            body = f"[{mapping[match['name']]}] " + body[match.end():]
+            blocks[b] = "\n".join(lines[:timing + 1] + wrap(body).split("\n"))
+    return "\n\n".join(blocks) + "\n"
+
+
+def rename_outputs(paths: dict[str, Path], mapping: dict[str, str]) -> list[Path]:
+    """Apply new speaker names to every transcript file that exists. Returns the files changed."""
+    mapping = {old: new for old, new in mapping.items() if new and new != old}
+    changed = []
+    for kind, path in paths.items():
+        path = Path(path)
+        if kind not in ("txt", "srt", "vtt") or not path.exists():
+            continue
+        text = path.read_text(encoding="utf-8")
+        updated = rename_txt(text, mapping) if kind == "txt" else rename_subtitles(text, mapping)
+        if updated != text:
+            _write_atomic(path, updated)
+            changed.append(path)
+    return changed
+
+
+def transcript_siblings(txt_path: Path) -> dict[str, Path]:
+    """For an existing <name>.transcript.txt: the subtitle files next to it and the original recording."""
+    txt_path = Path(txt_path)
+    base = txt_path.name[: -len(".transcript.txt")] if txt_path.name.lower().endswith(".transcript.txt") else txt_path.stem
+    found = {"txt": txt_path}
+    for kind in ("srt", "vtt"):
+        candidate = txt_path.with_name(f"{base}.transcript.{kind}")
+        if candidate.exists():
+            found[kind] = candidate
+    try:
+        first = txt_path.read_text(encoding="utf-8").splitlines()[0]
+    except (OSError, IndexError):
+        first = ""
+    if first.startswith("Transcript of "):
+        source = txt_path.with_name(first[len("Transcript of "):].strip())
+        if source.exists():
+            found["source"] = source
+    return found

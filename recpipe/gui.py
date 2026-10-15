@@ -20,8 +20,10 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -33,7 +35,8 @@ from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from . import APP_NAME, config, deps, env
 from .errors import DIARIZATION_URL, TOKENS_URL
-from .formats import clock, human_duration
+from .formats import (SpeakerSummary, clock, human_duration, name_problem, rename_outputs, speakers_in,
+                      transcript_siblings)
 from .pipeline import (DEFAULT_MODEL, DEFAULT_QUALITY, DIARIZATION, MODELS, QUALITY, SUPPORTED_EXTS, Job,
                        load_calibration, missing_components, plan_stages)
 
@@ -49,6 +52,10 @@ try:
     from PIL import Image, ImageDraw, ImageFont, ImageTk
 except Exception:  # icons and antialiased artwork are optional
     Image = None
+try:
+    import winsound  # plays voice samples in the Name speakers dialog
+except ImportError:
+    winsound = None
 
 # Taskbar identity. create_shortcut.ps1 stamps the same ID on the shortcut, so the
 # running window groups under the pinned icon instead of a generic Python button.
@@ -87,7 +94,8 @@ PALETTES = {
 ICONS = {  # Segoe Fluent Icons / Segoe MDL2 Assets code points
     "settings": "\uE713", "copy": "\uE8C8", "open": "\uE7C3", "captions": "\uE7F0", "folder": "\uE838",
     "cancel": "\uE711", "check": "\uE73E", "warning": "\uE7BA", "info": "\uE946", "error": "\uEA39",
-    "success": "\uE930", "link": "\uE8A7", "download": "\uE896",
+    "success": "\uE930", "link": "\uE8A7", "download": "\uE896", "people": "\uE716", "play": "\uE768",
+    "stop": "\uE71A",
 }
 SPEAKER_TAGS = len(PALETTES["dark"]["speakers"])  # same length in every palette
 ICON_FONTS = [r"C:\Windows\Fonts\SegoeIcons.ttf", r"C:\Windows\Fonts\segmdl2.ttf"]
@@ -106,6 +114,10 @@ def human_eta(seconds: float) -> str:
 def short_path(path, limit: int = 60) -> str:
     text = str(path)
     return text if len(text) <= limit else f"{text[:18]}\u2026{text[-(limit - 19):]}"
+
+
+def short_name(name: str, limit: int = 44) -> str:
+    return name if len(name) <= limit else f"{name[:limit - 14]}\u2026{name[-13:]}"
 
 
 def speaker_hint(choice: str) -> str:
@@ -448,13 +460,15 @@ class App:
         self.file_label.grid(row=0, column=1, sticky="w", padx=P(10))
         actions = ttk.Frame(heading)
         actions.grid(row=0, column=2, sticky="e")
+        self.names_btn = ttk.Button(actions, text="Name speakers", compound="left", command=self.open_speaker_names)
         self.open_btn = ttk.Button(actions, text="Open", compound="left", command=lambda: self.open_output("txt"))
         self.srt_btn = ttk.Button(actions, text="Subtitles", compound="left", command=lambda: self.open_output("srt"))
         self.folder_btn = ttk.Button(actions, text="Show in folder", compound="left", command=self.show_in_folder)
         self.copy_btn = ttk.Button(actions, text="Copy", style="Accent.TButton", compound="left",
                                    command=self.copy_transcript)
-        for button, icon, accent in ((self.open_btn, "open", False), (self.srt_btn, "captions", False),
-                                     (self.folder_btn, "folder", False), (self.copy_btn, "copy", True)):
+        for button, icon, accent in ((self.names_btn, "people", False), (self.open_btn, "open", False),
+                                     (self.srt_btn, "captions", False), (self.folder_btn, "folder", False),
+                                     (self.copy_btn, "copy", True)):
             button.pack(side="left", padx=(P(6), 0))
             button.state(["disabled"])
             self._icon_buttons.append((button, icon, accent))
@@ -834,7 +848,7 @@ class App:
 
     def _common_fields(self, diarize: bool) -> dict:
         return {"model": self.model_var.get(), "diarize": diarize, "quality": self._quality(),
-                "language": self.cfg["language"]}
+                "language": self.cfg["language"], "subtitles": bool(self.cfg.get("subtitles", True))}
 
     def warm_up(self):
         """Load libraries and the current models in the background, so the next drop starts at once."""
@@ -875,16 +889,22 @@ class App:
 
     def browse(self):
         patterns = " ".join(f"*{ext}" for ext in SUPPORTED_EXTS)
-        files = filedialog.askopenfilenames(title="Choose recordings to transcribe",
-                                            filetypes=[("Audio and video", patterns), ("All files", "*.*")])
+        files = filedialog.askopenfilenames(title="Choose recordings to transcribe (or a transcript to open)",
+                                            filetypes=[("Audio and video", patterns),
+                                                       ("Transcripts", "*.transcript.txt"), ("All files", "*.*")])
         if files:
             self.add_files(files)
 
     def add_files(self, names):
-        good, bad = [], []
+        good, bad, transcripts = [], [], []
         for name in names:
             path = Path(name)
-            (good if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS else bad).append(path)
+            if path.is_file() and path.name.lower().endswith(".transcript.txt"):
+                transcripts.append(path)
+            else:
+                (good if path.is_file() and path.suffix.lower() in SUPPORTED_EXTS else bad).append(path)
+        if transcripts:
+            self.open_transcript(transcripts[-1])
         if bad:
             more = f" (and {len(bad) - 1} more)" if len(bad) > 1 else ""
             self.show_banner("error", f"Can't transcribe \u201c{bad[0].name}\u201d{more}: not a supported audio or video file.",
@@ -929,7 +949,7 @@ class App:
             command["output_dir"] = self.cfg["output_dir"]
         if self.banner_kind in ("warning", "info", "success"):
             self.hide_banner()  # errors about an earlier file stay visible until dismissed
-        self.file_label.configure(text=f"\u00b7  {source.name}")
+        self.file_label.configure(text=f"\u00b7  {short_name(source.name)}")
         self._set_result(None, "")
         self._set_placeholder(f"Working on {source.name}\u2026", "The transcript will appear here when it's done.")
         if self._dispatch(command, {"kind": "transcribe", "source": source}) is not None:
@@ -1114,9 +1134,49 @@ class App:
         self.outputs, self.transcript = (done or {}), text
         for button in (self.copy_btn, self.open_btn, self.srt_btn, self.folder_btn):
             button.state(["!disabled"] if done else ["disabled"])
+        self.names_btn.state(["!disabled"] if done and speakers_in(text) else ["disabled"])
+        # No subtitle files for this transcript: hide the button rather than leave it dead.
+        if done and "srt" not in done:
+            self.srt_btn.pack_forget()
+        elif not self.srt_btn.winfo_manager():
+            self.srt_btn.pack(side="left", padx=(self.look.px(6), 0), before=self.folder_btn)
         if done:
             self._render_transcript(text)
         self._update_drop_size()
+
+    def open_transcript(self, path: Path):
+        """Show a transcript made earlier (dropped or browsed to), so its speakers can be named."""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            self.show_banner("error", f"Couldn't open {path.name}.", str(exc))
+            return
+        found = {kind: str(value) for kind, value in transcript_siblings(path).items()}
+        speakers = speakers_in(text)
+        if self.current is None:
+            self.progress.grid_remove()
+        self.file_label.configure(text=f"·  {short_name(path.name)}")
+        self._set_result(dict(found, speakers=len(speakers), diarized=bool(speakers)), text)
+
+    def open_speaker_names(self):
+        speakers = speakers_in(self.transcript)
+        if not self.outputs.get("txt") or not speakers:
+            self.show_banner("info", "This transcript has no speaker labels to name.",
+                             "Transcribe with Speakers set to Auto-detect (or a number) to get labelled turns.")
+            return
+        SpeakerNamesDialog(self, speakers, self.outputs)
+
+    def reload_transcript(self, changed: list[Path]):
+        try:
+            text = Path(self.outputs["txt"]).read_text(encoding="utf-8")
+        except OSError as exc:
+            self.show_banner("error", "The names were saved but the transcript couldn't be re-read.", str(exc))
+            return
+        self._set_result(self.outputs, text)
+        kinds = [p.suffix for p in changed]
+        listed = ", ".join(kinds[:-1]) + (" and " if len(kinds) > 1 else "") + kinds[-1] if kinds else ""
+        self.show_banner("success", f"Speaker names saved in the {listed} file{'s' if len(kinds) != 1 else ''}."
+                         if kinds else "No names changed.")
 
     def _render_transcript(self, text: str):
         box = self.text
@@ -1214,7 +1274,7 @@ class App:
         """Processing time for one hour of audio with the current choices, from this PC's measured speeds."""
         try:
             job = Job(source=Path("estimate"), model=self.model_var.get(), quality=self._quality(),
-                      diarize=self.speakers_var.get() != NO_LABELS)
+                      diarize=self.speakers_var.get() != NO_LABELS, subtitles=bool(self.cfg.get("subtitles", True)))
             rates = {s.key: s.estimate for s in plan_stages(job, 3600, load_calibration()) if s.per_audio_second}
         except Exception:
             return "\u2014"
@@ -1360,7 +1420,11 @@ class SettingsDialog(tk.Toplevel):
             ttk.Entry(files, textvariable=self.dir_var).grid(row=2, column=0, columnspan=2, sticky="ew")
             ttk.Button(files, text="Browse\u2026", image=look.button_image("folder"), compound="left",
                        command=self._browse_output).grid(row=2, column=2, sticky="e", padx=(P(10), 0))
-            note(files, 3, "Each recording produces .txt, .srt and .vtt files.")
+            self.subtitles_var = tk.BooleanVar(value=bool(cfg.get("subtitles", True)))
+            ttk.Checkbutton(files, text="Also save subtitles (.srt and .vtt)", variable=self.subtitles_var,
+                            style="Switch.TCheckbutton").grid(row=3, column=0, columnspan=3, sticky="w", pady=(P(12), 0))
+            note(files, 4, "The .txt is always saved. With subtitles off and speaker labels off, the word-timing "
+                           "step is skipped: about 25% faster.")
 
             # -- transcription
             tuning = card(1, 2, "Transcription")
@@ -1437,6 +1501,7 @@ class SettingsDialog(tk.Toplevel):
             cfg["output_dir"] = self.dir_var.get().strip()
             cfg["language"] = "auto" if self.language_var.get() == "Auto-detect" else "en"
             cfg["theme"] = next((k for k, v in THEME_LABELS.items() if v == self.theme_var.get()), "system")
+            cfg["subtitles"] = bool(self.subtitles_var.get())
             try:
                 cfg["threads"] = max(0, int(self.threads_var.get() or 0))
             except ValueError:
@@ -1451,6 +1516,169 @@ class SettingsDialog(tk.Toplevel):
         self.app.on_settings_saved(threads_changed, theme_changed)
         if then:
             then()
+
+
+class SpeakerNamesDialog(tk.Toplevel):
+    """Give the detected voices real names; rewrites the .txt/.srt/.vtt and the on-screen transcript."""
+
+    CLIP_SECONDS = 8
+
+    def __init__(self, app: App, speakers: list[SpeakerSummary], outputs: dict):
+        super().__init__(app.root)
+        self.withdraw()
+        self.app, self.outputs = app, outputs
+        look, P = app.look, app.look.px
+        self.title("Name speakers")
+        self.configure(bg=look.p["bg"])
+        self.transient(app.root)
+        self.resizable(False, False)
+        source = Path(outputs["source"]) if outputs.get("source") else None
+        self.source = source if source is not None and source.exists() else None
+        self.ffmpeg = shutil.which("ffmpeg")
+        can_play = winsound is not None and self.source is not None and self.ffmpeg is not None
+        self.playing: int | None = None
+        self._stop_after = None
+        self._clips: list[Path] = []
+
+        body = ttk.Frame(self, padding=(P(26), P(22), P(26), P(20)))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        ttk.Label(body, text="Name the speakers", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(body, text="Type a name for each voice. It replaces the label everywhere in this transcript and its "
+                             "subtitle files. Leave a box empty to keep the current name. Giving two voices the same "
+                             "name merges them.",
+                  style="Muted.TLabel", wraplength=P(660), justify="left").grid(row=1, column=0, sticky="w",
+                                                                                 pady=(P(4), P(14)))
+        card = ttk.Frame(body, style="Card.TFrame", padding=(P(16), P(10), P(16), P(10)))
+        card.grid(row=2, column=0, sticky="ew")
+        card.columnconfigure(1, weight=1)
+        style = ttk.Style(self)
+        self.entries: dict[str, ttk.Entry] = {}
+        self.play_buttons: dict[int, ttk.Button] = {}
+        for i, speaker in enumerate(speakers):
+            row = i * 2
+            if i:
+                ttk.Separator(card).grid(row=row - 1, column=0, columnspan=4, sticky="ew", pady=P(8))
+            label_style = f"Speaker{i % SPEAKER_TAGS}.TLabel"
+            style.configure(label_style, foreground=look.p["speakers"][i % SPEAKER_TAGS],
+                            font=look.fonts["reading_strong"])
+            who = ttk.Frame(card)
+            who.grid(row=row, column=0, sticky="nw", padx=(0, P(18)), pady=P(4))
+            ttk.Label(who, text=speaker.name, style=label_style).pack(anchor="w")
+            ttk.Label(who, text=f"{speaker.turns} turn{'s' if speaker.turns != 1 else ''}  ·  "
+                                f"{human_duration(speaker.seconds)}", style="Hint.TLabel").pack(anchor="w")
+            quote = speaker.sample if len(speaker.sample) <= 150 else speaker.sample[:147].rsplit(" ", 1)[0] + "…"
+            ttk.Label(card, text=f"“{quote}”", style="Hint.TLabel", wraplength=P(330),
+                      justify="left").grid(row=row, column=1, sticky="w", pady=P(4))
+            play = ttk.Button(card, text="Play", image=look.button_image("play"), compound="left", width=6,
+                              command=lambda i=i, s=speaker: self.toggle_play(i, s))
+            play.grid(row=row, column=2, padx=(P(14), P(10)))
+            if not can_play:
+                play.state(["disabled"])
+            self.play_buttons[i] = play
+            entry = ttk.Entry(card, width=22)
+            entry.grid(row=row, column=3, sticky="e")
+            self.entries[speaker.name] = entry
+
+        if not can_play:
+            reason = ("the original recording isn't next to the transcript any more" if self.source is None
+                      else "ffmpeg wasn't found")
+            ttk.Label(body, text=f"Play is unavailable: {reason}.", style="Hint.TLabel").grid(
+                row=3, column=0, sticky="w", pady=(P(8), 0))
+        footer = ttk.Frame(body)
+        footer.grid(row=4, column=0, sticky="e", pady=(P(18), 0))
+        ttk.Button(footer, text="Save names", style="Accent.TButton", command=self.save).pack(side="right")
+        ttk.Button(footer, text="Cancel", command=self.close).pack(side="right", padx=(0, P(8)))
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda e: self.close())
+        self.bind("<Return>", lambda e: self.save())
+
+        set_title_bar(self, look.theme == "dark")
+        self.update_idletasks()
+        root = app.root
+        x = root.winfo_rootx() + (root.winfo_width() - self.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + max((root.winfo_height() - self.winfo_reqheight()) // 3, 0)
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
+        self.grab_set()
+        if self.entries:
+            next(iter(self.entries.values())).focus_set()
+
+    # -- voice samples
+
+    def toggle_play(self, index: int, speaker: SpeakerSummary):
+        if self.playing == index:
+            self.stop()
+            return
+        self.stop()
+        start = max(speaker.sample_start - 0.2, 0.0)
+        length = min(max(speaker.sample_end - speaker.sample_start + 0.4, 2.0), self.CLIP_SECONDS)
+        clip = Path(tempfile.gettempdir()) / f"local-transcriber-voice-{os.getpid()}-{index}.wav"
+        self.configure(cursor="watch")
+        self.update_idletasks()
+        try:
+            subprocess.run([self.ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-ss", f"{start:.2f}",
+                            "-t", f"{length:.2f}", "-i", str(self.source), "-vn", "-ac", "1", "-ar", "22050", str(clip)],
+                           capture_output=True, check=True, timeout=60, creationflags=NO_WINDOW)
+            winsound.PlaySound(str(clip), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't play this voice sample.\n\n{exc}", parent=self)
+            return
+        finally:
+            self.configure(cursor="")
+        self._clips.append(clip)
+        self.playing = index
+        self.play_buttons[index].configure(text="Stop", image=self.app.look.button_image("stop"))
+        self._stop_after = self.after(int(length * 1000) + 300, self.stop)
+
+    def stop(self):
+        if self._stop_after is not None:
+            self.after_cancel(self._stop_after)
+            self._stop_after = None
+        if self.playing is not None:
+            try:
+                winsound.PlaySound(None, 0)
+            except RuntimeError:
+                pass
+            self.play_buttons[self.playing].configure(text="Play", image=self.app.look.button_image("play"))
+            self.playing = None
+
+    def close(self):
+        self.stop()
+        for clip in self._clips:
+            try:
+                clip.unlink()
+            except OSError:
+                pass
+        self.destroy()
+
+    # -- saving
+
+    def save(self):
+        mapping = {}
+        for old, entry in self.entries.items():
+            new = " ".join(entry.get().split())
+            if not new:
+                continue
+            problem = name_problem(new)
+            if problem:
+                messagebox.showerror(APP_NAME, problem, parent=self)
+                entry.focus_set()
+                return
+            mapping[old] = new
+        if not mapping:
+            self.close()
+            return
+        files = {kind: path for kind, path in self.outputs.items() if kind in ("txt", "srt", "vtt")}
+        try:
+            changed = rename_outputs(files, mapping)
+        except OSError as exc:
+            messagebox.showerror(APP_NAME, f"Couldn't update the transcript files.\n\n{exc}\n\n"
+                                           "If one of them is open in another program, close it and try again.",
+                                 parent=self)
+            return
+        self.close()
+        self.app.reload_transcript(changed)
 
 
 def _enable_dpi_awareness():

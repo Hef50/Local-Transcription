@@ -167,3 +167,73 @@ class PresetTests(unittest.TestCase):
         Job = self.pipeline.Job
         self.assertEqual(Job(source=Path("x"), model="medium.en", language=None).effective_language, "en")
         self.assertIsNone(Job(source=Path("x"), model="large-v3", language=None).effective_language)
+
+
+class TxtOnlyAndRenameTests(unittest.TestCase):
+    def _write(self, tmp, subtitles=True):
+        return formats.write_outputs(RESULT, Path("C:/x/meeting.mp4"), Path(tmp), model="small.en", duration=6.0,
+                                     label_speakers=True, subtitles=subtitles)
+
+    def test_txt_only_writes_one_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, _ = self._write(tmp, subtitles=False)
+            self.assertEqual(set(paths), {"txt"})
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["meeting.transcript.txt"])
+
+    def test_speakers_in_finds_each_voice_with_a_sample(self):
+        txt = formats.render_txt(formats.normalize(RESULT, True), ["Header", "6 s of audio · 2 speakers"])
+        speakers = formats.speakers_in(txt)
+        self.assertEqual([s.name for s in speakers], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(speakers[1].sample, "Fine, thanks.")
+        self.assertEqual((speakers[1].sample_start, speakers[1].sample_end), (4.0, 6.0))
+
+    def test_rename_everywhere_and_recount_merged_speakers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths, _ = self._write(tmp)
+            changed = formats.rename_outputs(paths, {"Speaker 1": "Alex", "Speaker 2": "Alex"})
+            self.assertEqual(len(changed), 3)
+            txt = paths["txt"].read_text(encoding="utf-8")
+            self.assertIn("Alex [00:00 - 00:04]", txt)
+            self.assertNotIn("Speaker", txt.split("\n", 2)[2])
+            self.assertIn("1 speaker ·", txt.splitlines()[1])  # header recounted after the merge
+            for kind in ("srt", "vtt"):
+                body = paths[kind].read_text(encoding="utf-8")
+                self.assertIn("[Alex] Hello there.", body)
+                self.assertNotIn("[Speaker", body)
+
+    def test_rename_rewraps_long_cues(self):
+        srt = "1\n00:00:00,000 --> 00:00:03,000\n[Speaker 1] I want to review the budget for\nthe community garden today.\n"
+        out = formats.rename_subtitles(srt, {"Speaker 1": "Alexandra Montgomery"})
+        body = out.split("\n")[2:]
+        self.assertTrue(body[0].startswith("[Alexandra Montgomery] "))
+        self.assertTrue(all(len(line) <= 60 for line in body if line))
+        self.assertTrue(out.endswith("\n"))
+
+    def test_rename_leaves_spoken_words_alone(self):
+        txt = "Speaker 1 [00:00 - 00:04]\nI am Speaker 1 in this test.\n"
+        self.assertEqual(formats.rename_txt(txt, {"Speaker 1": "Sam"}), "Sam [00:00 - 00:04]\nI am Speaker 1 in this test.\n")
+
+    def test_name_problems(self):
+        self.assertIsNone(formats.name_problem("Dr. Jane O'Neil"))
+        self.assertIsNotNone(formats.name_problem("[Host]"))
+        self.assertIsNotNone(formats.name_problem("x" * 61))
+
+    def test_transcript_siblings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "meeting.mp4"
+            source.write_bytes(b"fake")
+            paths, _ = formats.write_outputs(RESULT, source, Path(tmp), model="small.en", duration=6.0,
+                                             label_speakers=True)
+            found = formats.transcript_siblings(paths["txt"])
+            self.assertEqual(set(found), {"txt", "srt", "vtt", "source"})
+            self.assertEqual(found["source"], source)
+
+
+class AlignmentPlanTests(unittest.TestCase):
+    def test_alignment_skipped_only_when_nothing_needs_it(self):
+        from recpipe import pipeline
+        def stage_keys(**kw):
+            return {s.key for s in pipeline.plan_stages(pipeline.Job(source=Path("x"), **kw), 60, {})}
+        self.assertNotIn("align", stage_keys(diarize=False, subtitles=False))
+        self.assertIn("align", stage_keys(diarize=False, subtitles=True))
+        self.assertIn("align", stage_keys(diarize=True, subtitles=False))

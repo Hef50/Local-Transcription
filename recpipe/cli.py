@@ -97,6 +97,8 @@ def build_parser(cfg: dict) -> argparse.ArgumentParser:
     p.add_argument("--beam-size", type=int, default=None, help="override the preset's beam size")
     p.add_argument("--output-dir", help="write transcripts here instead of next to each file")
     p.add_argument("--no-diarize", action="store_true", help="skip speaker labels")
+    p.add_argument("--subtitles", action=argparse.BooleanOptionalAction, default=bool(cfg.get("subtitles", True)),
+                   help="also write .srt and .vtt next to the .txt (default: %(default)s)")
     p.add_argument("--speakers", type=int, help="exact number of speakers, if known")
     p.add_argument("--min-speakers", type=int)
     p.add_argument("--max-speakers", type=int)
@@ -149,6 +151,7 @@ def serve(emit, session) -> int:
                 language=None if language == "auto" else language,
                 models_dir=session.models_dir, threads=session.threads,
                 quality=command.get("quality") or cfg.get("quality") or pipeline.DEFAULT_QUALITY,
+                subtitles=bool(command.get("subtitles", cfg.get("subtitles", True))),
             )
             if kind == "warm":
                 tagged({"event": "warm_done", **session.warm(job, tagged)})
@@ -189,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
 
     language = args.language or cfg.get("language") or "en"
     base = dict(
-        model=args.model, quality=args.quality, beam_size=args.beam_size,
+        model=args.model, quality=args.quality, beam_size=args.beam_size, subtitles=args.subtitles,
         output_dir=Path(args.output_dir) if args.output_dir else None,
         diarize=not args.no_diarize, hf_token=_token(cfg, args.hf_token),
         num_speakers=args.speakers, min_speakers=args.min_speakers, max_speakers=args.max_speakers,
@@ -241,5 +244,6 @@ def main(argv: list[str] | None = None) -> int:
             speakers = f"{summary['speakers']} speakers" if summary["diarized"] else "no speaker labels"
             print(f"  Done in {summary['elapsed_s']:.0f} s ({speakers}):", file=sys.stderr)
             for kind in ("txt", "srt", "vtt"):
-                print(f"    {summary[kind]}", file=sys.stderr)
+                if kind in summary:
+                    print(f"    {summary[kind]}", file=sys.stderr)
     return 1 if failures else 0

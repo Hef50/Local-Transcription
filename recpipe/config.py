@@ -18,6 +18,7 @@ DEFAULTS = {
     "threads": 0,  # 0 = automatic
     "quality": "balanced",  # fast | balanced | best (see pipeline.PRESETS)
     "theme": "system",  # system | light | dark
+    "subtitles": True,  # also write .srt and .vtt next to the .txt
     "models_dir": "",  # "" = <app folder>/models
 }
 

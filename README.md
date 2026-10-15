@@ -53,6 +53,12 @@ your Windows light/dark setting (or pick one in Settings → Appearance), Fluent
 * **Drop zone:** large when the window is empty, a slim bar while a file is working or a transcript is shown.
 * **Progress card:** both parallel stages, percent, elapsed, time left, Cancel.
 * **Transcript:** speaker names in colour, timestamps, Open / Subtitles / Show in folder / Copy.
+* **Name speakers:** after a transcript is done, give each voice a real name. Each voice is listed with
+  a quote, how long they spoke and a **Play** button to hear them. The names replace "Speaker 1",
+  "Speaker 2"... in the .txt, .srt, .vtt and the window. Giving two voices the same name merges them
+  (useful when one person was split in two).
+* **Older transcripts:** drop a `*.transcript.txt` on the window (or pick it with Ctrl+O) to open it
+  and name its speakers. Play works when the original recording is still next to it.
 * **Status bar:** whether the speech engine is loaded and whether the next file can run fully offline.
 * `Ctrl+O` opens the file picker.
 
@@ -63,6 +69,7 @@ your Windows light/dark setting (or pick one in Settings → Appearance), Fluent
 .venv\Scripts\python.exe transcribe.py a.mp3 b.mp4 --model small.en --speakers 3
 .venv\Scripts\python.exe transcribe.py interview.wav --no-diarize --output-dir D:\Transcripts
 .venv\Scripts\python.exe transcribe.py lecture.mp4 --quality fast
+.venv\Scripts\python.exe transcribe.py notes.m4a --no-diarize --no-subtitles   &:: .txt only, fastest
 .venv\Scripts\python.exe transcribe.py --prepare --model medium.en   &:: download models for offline use
 ```
 
@@ -87,6 +94,12 @@ Morning. I looked at the numbers last night...
 
 Subtitle cues are at most 2 lines × 42 characters and about 6 seconds each, prefixed with `[Speaker N]`.
 
+**Only need the .txt?** Turn off Settings → Transcript files → *Also save subtitles*. On its own that
+saves nothing measurable (writing files takes ~0.03 s). But with speaker labels also off, the app
+skips the word-timing (alignment) step, which only subtitles and speaker turns need: see the Speed
+section. For pasting into Claude or another AI, the .txt is the best format anyway: about half the
+tokens of the .srt/.vtt, with each speaker's turn kept as one paragraph.
+
 ## Speed
 
 Measured on this laptop (i7-1355U, CPU only, int8, 10 threads) with a 5-minute two-speaker
@@ -98,6 +111,7 @@ recording. Numbers are processing time as a multiple of audio length; lower is f
 | Transcription (medium.en) | 0.44–0.55× | same | ~0.42× | beam 5 kept; beam 1 only saves ~5% |
 | Word alignment | 0.16× | 0.16× | 0.145× | int8 is 9% faster, same timings (median shift 0 ms) |
 | Speaker diarization | 0.82× | 0.27× | 0.13× | window step 0.1 → 0.25 (3×, 99.1% same labels) / 0.5 (6×, 98.3%) |
+| Word alignment, for a .txt without speaker labels | 0.16× | skipped | skipped | only subtitles and speaker turns need it: 190 s → 145 s on the 5-min file (24% faster), same words |
 | Diarization scheduling | after transcription | **in parallel** | in parallel | 1.27× on the pair; the ETA tracks both |
 | Per-file start-up | ~30 s imports + ~8 s model loads | **~0 s** | ~0 s | one warm worker process keeps models loaded |
 | **5-minute file, with speakers** | **~9.7 min** | **5.2 min** (4.7 min after the first file) | | measured end to end |
